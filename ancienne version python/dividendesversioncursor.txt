@@ -1,0 +1,582 @@
+import re
+import random
+import time
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import requests
+import streamlit as st  # S'assurer que l'import global est bien présent en tête de fichier
+import yfinance as yf
+from bs4 import BeautifulSoup
+from yahooquery import Ticker
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
+
+def safe_get(url, max_retries=3, sleep_base=1.0):
+    for attempt in range(max_retries):
+        try:
+            time.sleep(random.uniform(0.5, 1.5))
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            if r.status_code == 200:
+                return r.text
+            elif r.status_code == 429:
+                time.sleep(sleep_base * 4)
+        except:
+            pass
+        time.sleep(sleep_base * (2**attempt) + random.random() * 0.5)
+    return None
+
+
+def get_isin_from_yahoo(ticker):
+    try:
+        t = Ticker(ticker, timeout=15)
+        p = t.price
+        if isinstance(p, dict) and ticker in p:
+            d = p[ticker]
+            for k in ["isin", "ISIN", "isinCode"]:
+                if k in d and d[k]:
+                    return d[k]
+    except:
+        pass
+    return None
+
+
+def get_dividends_yahoo(ticker):
+    try:
+        t = Ticker(ticker, timeout=20)
+        d = t.dividends
+        if isinstance(d, pd.DataFrame) and not d.empty:
+            if isinstance(d.index, pd.MultiIndex):
+                if ticker in d.index.get_level_values(0):
+                    d = d.xs(ticker, level=0)
+                else:
+                    return None
+
+            if "dividends" in d.columns:
+                d.index = pd.to_datetime(d.index)
+                s = d["dividends"].sort_index()
+                return s
+    except:
+        pass
+    return None
+
+
+def get_dividends_yfinance_native(ticker):
+    def _extract_dividends_from_history(hist, ticker_symbol):
+        if hist is None or hist.empty:
+            return None
+
+        if isinstance(hist.columns, pd.MultiIndex):
+            # Newer yfinance versions may return MultiIndex even for one ticker.
+            if ticker_symbol in hist.columns.get_level_values(1):
+                try:
+                    div_col = ("Dividends", ticker_symbol)
+                    if div_col in hist.columns:
+                        s = hist[div_col]
+                    else:
+                        return None
+                except Exception:
+                    return None
+            elif ticker_symbol in hist.columns.get_level_values(0):
+                try:
+                    div_col = (ticker_symbol, "Dividends")
+                    if div_col in hist.columns:
+                        s = hist[div_col]
+                    else:
+                        return None
+                except Exception:
+                    return None
+            else:
+                # Fallback: flatten first level lookup for single-ticker responses.
+                level0 = hist.columns.get_level_values(0)
+                if "Dividends" not in level0:
+                    return None
+                div_frame = hist.xs("Dividends", axis=1, level=0)
+                if div_frame.empty:
+                    return None
+                s = div_frame.iloc[:, 0]
+        else:
+            if "Dividends" not in hist.columns:
+                return None
+            s = hist["Dividends"]
+
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        s = s[s > 0]
+        if s.empty:
+            return None
+        s.index = pd.to_datetime(s.index).tz_localize(None)
+        return s.sort_index()
+
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period="max", auto_adjust=False, raise_errors=False)
+        s = _extract_dividends_from_history(hist, ticker)
+        if s is not None:
+            return s
+
+        # Secondary fallback: direct download API can succeed when Ticker.history is flaky.
+        hist2 = yf.download(
+            ticker,
+            period="max",
+            auto_adjust=False,
+            actions=True,
+            progress=False,
+            threads=False,
+        )
+        s = _extract_dividends_from_history(hist2, ticker)
+        if s is not None:
+            return s
+    except:
+        pass
+    return None
+
+
+def normalize_boursorama_ticker(t):
+    code = t.split(".")[0]
+    if ".PA" in t:
+        return f"1rP{code}"
+    return code
+
+
+def get_dividends_boursorama(ticker):
+    code = normalize_boursorama_ticker(ticker)
+    url = f"https://www.boursorama.com/cours/dividendes/{code}/"
+    html = safe_get(url)
+    if html is None:
+        return None
+        
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.find("table", {"class": "c-table"})
+    if table is None:
+        table = soup.find("table")
+        
+    if table is None:
+        return None
+        
+    rows = table.find_all("tr")
+    data = []
+    for r in rows[1:]:
+        c = r.find_all("td")
+        if len(c) < 2:
+            continue
+        date_txt = c[0].get_text(strip=True)
+        div_txt = c[1].get_text(strip=True).replace(",", ".")
+        
+        if len(date_txt) == 4 and date_txt.isdigit():
+            date_txt = f"{date_txt}-06-01"
+            
+        try:
+            v = float(re.findall(r"[-+]?\d*\.?\d+", div_txt)[0])
+        except:
+            continue
+        data.append((date_txt, v))
+        
+    if not data:
+        return None
+        
+    idx = pd.to_datetime([d[0] for d in data], errors="coerce")
+    vals = [d[1] for d in data]
+    s = pd.Series(vals, index=idx).dropna().sort_index()
+    return s if not s.empty else None
+
+
+def get_dividends_lecho(isin):
+    if isin is None:
+        return None
+    url = f"https://www.lecho.be/cours/{isin}"
+    html = safe_get(url)
+    if html is None:
+        return None
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+    matches = re.findall(r"Dividende\s+([\d,\.]+)", text)
+    if not matches:
+        return None
+    vals = []
+    for m in matches:
+        try:
+            vals.append(float(m.replace(",", ".")))
+        except:
+            pass
+    if not vals:
+        return None
+    years = list(range(len(vals)))
+    idx = pd.to_datetime(["2020-01-01"] * len(vals)) + pd.to_timedelta(
+        years, unit="Y"
+    )
+    return pd.Series(vals, index=idx).sort_index()
+
+
+def compute_dividend_metrics(s, last_price):
+    if s is None or len(s) == 0 or last_price is None or last_price <= 0:
+        return None
+    df = s.groupby(s.index.year).sum().sort_index()
+    if df.empty:
+        return None
+    last_div = df.iloc[-1]
+    y = last_div / last_price
+    
+    if len(df) >= 5:
+        start = df.iloc[-5]
+        end = df.iloc[-1]
+        if start > 0 and end > 0:
+            cagr = (end / start) ** (1 / 4) - 1
+        else:
+            cagr = None
+    else:
+        cagr = None
+        
+    gy = 0
+    if len(df) >= 2:
+        p = df.iloc[0]
+        for v in df.iloc[1:]:
+            if v >= p:
+                gy += 1
+            p = v
+            
+    return {
+        "last_year_div": float(last_div),
+        "current_yield": float(y),
+        "cagr_5y": float(cagr) if cagr is not None else None,
+        "growth_years": int(gy),
+        "years_available": int(len(df)),
+    }
+
+
+def get_payout_ratios_yahoo(ticker):
+    payout = None
+    fcf = None
+    try:
+        t = Ticker(ticker, timeout=20)
+        inc = t.income_statement(frequency="a")
+        cf = t.cash_flow(frequency="a")
+        if (
+            isinstance(inc, pd.DataFrame)
+            and not inc.empty
+            and isinstance(cf, pd.DataFrame)
+            and not cf.empty
+        ):
+            inc = inc.sort_index()
+            cf = cf.sort_index()
+            li = inc.iloc[-1]
+            lc = cf.iloc[-1]
+            div_cols = [c for c in lc.index if "dividend" in c.lower()]
+            net_cols = [
+                c for c in li.index if "net" in c.lower() and "income" in c.lower()
+            ]
+            fcf_cols = [
+                c for c in lc.index if "free" in c.lower() and "cash" in c.lower()
+            ]
+            if div_cols and net_cols:
+                dv = float(lc[div_cols[0]])
+                ni = float(li[net_cols[0]])
+                if ni != 0:
+                    payout = abs(dv) / abs(ni)
+            if div_cols and fcf_cols:
+                dv = float(lc[div_cols[0]])
+                fc = float(lc[fcf_cols[0]])
+                if fc != 0:
+                    fcf = abs(dv) / abs(fc)
+    except:
+        pass
+    return payout, fcf
+
+
+def score_stability(g, y):
+    if y <= 1:
+        return 0
+    r = g / (y - 1)
+    if r >= 0.8:
+        return 30
+    if r >= 0.5:
+        return 20
+    if r > 0:
+        return 10
+    return 0
+
+
+def score_growth(c):
+    if c is None:
+        return 0
+    if c < 0:
+        return 0
+    if c < 0.03:
+        return 10
+    if c < 0.07:
+        return 20
+    return 25
+
+
+def score_payout(p):
+    if p is None:
+        return 10
+    if p > 0.8:
+        return 0
+    if p > 0.6:
+        return 10
+    if p > 0.4:
+        return 15
+    return 20
+
+
+def score_fcf_payout(p):
+    if p is None:
+        return 10
+    if p > 0.8:
+        return 0
+    if p > 0.6:
+        return 10
+    if p > 0.4:
+        return 15
+    return 20
+
+
+def score_yield(y):
+    if y is None:
+        return 0
+    if y < 0.01:
+        return 0
+    if y < 0.02:
+        return 2
+    if y < 0.04:
+        return 4
+    return 5
+
+
+def compute_dividend_quality_score(m, p, fcf):
+    return {
+        "stability": score_stability(m["growth_years"], m["years_available"]),
+        "growth": score_growth(m["cagr_5y"]),
+        "payout": score_payout(p),
+        "fcf_payout": score_fcf_payout(fcf),
+        "yield": score_yield(m["current_yield"]),
+    }
+
+
+def radar_score_chart(s, t):
+    c = ["Stabilité", "Croissance", "Payout", "FCF Payout", "Rendement"]
+    v = [s["stability"], s["growth"], s["payout"], s["fcf_payout"], s["yield"]]
+    v.append(v[0])
+    c2 = c + [c[0]]
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(r=v, theta=c2, fill="toself", marker_color="teal"))
+    fig.update_layout(
+        polar=dict(radialaxis=dict(visible=True, range=[0, 30])),
+        title=f"Profil de Qualité du Dividende - {t}",
+    )
+    return fig
+
+
+def render_dividendes_dashboard(prices, returns):
+    st.subheader("Dividendes & Qualité")
+    tickers = [str(t).strip() for t in prices.columns]
+    last_prices = prices.iloc[-1]
+    ticker_signature = "|".join(tickers)
+    indice_actuel = f"data_divs_{abs(hash(ticker_signature))}"
+    processed_batches_key = f"{indice_actuel}_processed_batches"
+
+    if indice_actuel not in st.session_state:
+        st.session_state[indice_actuel] = []
+    if processed_batches_key not in st.session_state:
+        st.session_state[processed_batches_key] = []
+
+    max_default = min(30, len(tickers))
+    max_to_analyze = st.slider(
+        "Nombre max de tickers a analyser",
+        min_value=10 if len(tickers) >= 10 else len(tickers),
+        max_value=len(tickers),
+        value=max_default,
+        step=5 if len(tickers) >= 10 else 1,
+    )
+    batch_size = st.selectbox("Taille de lot", [10, 20, 25, 30], index=1)
+
+    limited_tickers = tickers[:max_to_analyze]
+    total_batches = max(1, int(np.ceil(len(limited_tickers) / batch_size)))
+
+    batch_selector_key = f"{indice_actuel}_batch_selector"
+    if batch_selector_key not in st.session_state:
+        st.session_state[batch_selector_key] = 0
+    st.session_state[batch_selector_key] = min(
+        st.session_state[batch_selector_key], total_batches - 1
+    )
+    current_batch_idx = st.session_state[batch_selector_key]
+
+    start_idx = current_batch_idx * batch_size
+    end_idx = min(start_idx + batch_size, len(limited_tickers))
+    tickers_batch = limited_tickers[start_idx:end_idx]
+
+    st.caption(
+        f"Lot {current_batch_idx + 1}/{total_batches} - Tickers {start_idx + 1} a {end_idx} "
+        f"sur {len(limited_tickers)} selectionnes ({len(tickers)} disponibles)."
+    )
+
+    c1, c2, c3 = st.columns(3)
+    analyze_clicked = c1.button("Analyser ce lot")
+    next_clicked = c2.button("Lot suivant")
+    reset_clicked = c3.button("Recommencer")
+
+    if next_clicked:
+        if current_batch_idx < total_batches - 1:
+            st.session_state[batch_selector_key] = current_batch_idx + 1
+        st.rerun()
+
+    if reset_clicked:
+        if indice_actuel in st.session_state:
+            del st.session_state[indice_actuel]
+        if processed_batches_key in st.session_state:
+            del st.session_state[processed_batches_key]
+        if batch_selector_key in st.session_state:
+            del st.session_state[batch_selector_key]
+        st.rerun()
+
+    if analyze_clicked and tickers_batch:
+        existing_rows = st.session_state[indice_actuel]
+        existing_tickers = {row["Ticker"] for row in existing_rows}
+
+        status = st.empty()
+        progress = st.progress(0)
+        source_counts = {
+            "YahooQuery": 0,
+            "yfinance": 0,
+            "Boursorama": 0,
+            "LEcho": 0,
+            "Echecs": 0,
+        }
+
+        status.info("Collecte des dividendes en cours sur le lot courant...")
+        for i, t in enumerate(tickers_batch):
+            if t in existing_tickers:
+                progress.progress((i + 1) / len(tickers_batch))
+                continue
+
+            status.text(f"Analyse : {t} ({i + 1}/{len(tickers_batch)})...")
+            lp = float(last_prices[t]) if not np.isnan(last_prices[t]) else None
+            if lp is None or lp <= 0:
+                source_counts["Echecs"] += 1
+                progress.progress((i + 1) / len(tickers_batch))
+                continue
+
+            time.sleep(random.uniform(0.4, 0.8))
+
+            source_used = None
+            s = get_dividends_yahoo(t)
+            if s is not None:
+                source_used = "YahooQuery"
+            else:
+                s = get_dividends_yfinance_native(t)
+                if s is not None:
+                    source_used = "yfinance"
+                else:
+                    s = get_dividends_boursorama(t)
+                    if s is not None:
+                        source_used = "Boursorama"
+                    else:
+                        isin = get_isin_from_yahoo(t)
+                        if isin:
+                            s = get_dividends_lecho(isin)
+                            if s is not None:
+                                source_used = "LEcho"
+
+            m = compute_dividend_metrics(s, lp) if s is not None else None
+            p, fcf = get_payout_ratios_yahoo(t)
+
+            if m is not None:
+                sc = compute_dividend_quality_score(m, p, fcf)
+                existing_rows.append(
+                    {
+                        "Ticker": t,
+                        "Prix": lp,
+                        "Dividende annuel": m["last_year_div"],
+                        "Rendement": m["current_yield"],
+                        "CAGR 5 ans": m["cagr_5y"],
+                        "Années de croissance": m["growth_years"],
+                        "Payout": p,
+                        "FCF Payout": fcf,
+                        "Score": sc["stability"]
+                        + sc["growth"]
+                        + sc["payout"]
+                        + sc["fcf_payout"]
+                        + sc["yield"],
+                        "Score stabilité": sc["stability"],
+                        "Score croissance": sc["growth"],
+                        "Score payout": sc["payout"],
+                        "Score FCF": sc["fcf_payout"],
+                        "Score rendement": sc["yield"],
+                    }
+                )
+                if source_used is None:
+                    source_counts["Echecs"] += 1
+                else:
+                    source_counts[source_used] += 1
+            else:
+                source_counts["Echecs"] += 1
+
+            progress.progress((i + 1) / len(tickers_batch))
+
+        st.session_state[indice_actuel] = existing_rows
+        processed = set(st.session_state[processed_batches_key])
+        processed.add(current_batch_idx)
+        st.session_state[processed_batches_key] = sorted(processed)
+
+        status.empty()
+        progress.empty()
+        st.info(
+            "Resume du lot - "
+            f"YahooQuery: {source_counts['YahooQuery']}, "
+            f"yfinance: {source_counts['yfinance']}, "
+            f"Boursorama: {source_counts['Boursorama']}, "
+            f"LEcho: {source_counts['LEcho']}, "
+            f"Echecs: {source_counts['Echecs']}"
+        )
+
+    donnees_sauvegardees = st.session_state[indice_actuel]
+
+    if not donnees_sauvegardees:
+        st.warning(
+            "Aucune donnee collectee pour l'instant. Lancez l'analyse du lot courant."
+        )
+        return
+
+    df = pd.DataFrame(donnees_sauvegardees).sort_values("Score", ascending=False)
+    devise = "€" if any(".PA" in tk or ".BR" in tk for tk in tickers) else "$"
+
+    st.dataframe(
+        df.style.format(
+            {
+                "Prix": f"{{:.2f}} {devise}",
+                "Dividende annuel": f"{{:.2f}} {devise}",
+                "Rendement": "{:.2%}",
+                "CAGR 5 ans": "{:.2%}",
+                "Payout": "{:.2%}" if not df["Payout"].isnull().all() else "-",
+                "FCF Payout": "{:.2%}" if not df["FCF Payout"].isnull().all() else "-",
+            }, na_rep="-"
+        ).background_gradient(cmap="RdYlGn", subset=["Score", "Rendement"])
+    )
+
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button("Télécharger le rapport (CSV)", csv, "dividendes.csv")
+
+    st.write("---")
+    fig = px.scatter(
+        df, x="Rendement", y="Score", text="Ticker", size="Score", color="Score",
+        color_continuous_scale="RdYlGn", title="Analyse Risque / Qualité : Rendement vs Score Global",
+    )
+    fig.update_traces(textposition="top center")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.write("---")
+    tsel = st.selectbox("Sélectionner un actif pour voir le détail :", df["Ticker"])
+    r = df[df["Ticker"] == tsel].iloc[0]
+    sc = {
+        "stability": r["Score stabilité"],
+        "growth": r["Score croissance"],
+        "payout": r["Score payout"],
+        "fcf_payout": r["Score FCF"],
+        "yield": r["Score rendement"],
+    }
+    fig2 = radar_score_chart(sc, tsel)
+    st.plotly_chart(fig2, use_container_width=True)
