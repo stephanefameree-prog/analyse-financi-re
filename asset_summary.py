@@ -7,6 +7,7 @@ from display_units import (
     ASSET_SUMMARY_FORMAT,
     ASSET_SUMMARY_LABELS,
     format_map_for_labeled_columns,
+    pick_existing_columns,
     rename_columns_for_display,
 )
 from fundamentals import compute_market_indicators, fetch_fundamentals_for_ticker
@@ -263,7 +264,10 @@ def render_asset_summary_dashboard(prices):
     )
     st.dataframe(
         df_display.style.format(summary_format, na_rep="-")
-        .background_gradient(cmap="RdYlGn", subset=["Score global (pts)", "Score global"])
+        .background_gradient(
+            cmap="RdYlGn",
+            subset=pick_existing_columns(df_display, "Score global (pts)", "Score global"),
+        )
     )
 
     detail = st.selectbox("Détail par actif", df["Ticker"], key="summary_detail")

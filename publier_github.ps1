@@ -46,7 +46,36 @@ if ($RemoteUrl -and -not (git remote get-url origin 2>$null)) {
     Write-Host "Remote origin : $RemoteUrl" -ForegroundColor Green
 }
 
+$blockedPatterns = @(
+    "mon_portefeuille.csv",
+    "watchlists.json",
+    "dividendes_cache.json",
+    "fundamentals_cache.json"
+)
+foreach ($pattern in $blockedPatterns) {
+    if (Test-Path $pattern) {
+        $tracked = git ls-files --error-unmatch $pattern 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "ERREUR : $pattern est suivi par Git — retrait du suivi requis." -ForegroundColor Red
+            Write-Host "  git rm --cached $pattern"
+            exit 1
+        }
+    }
+}
+
 git add -A
+
+$staged = git diff --cached --name-only
+foreach ($file in $staged) {
+    foreach ($pattern in $blockedPatterns) {
+        if ($file -eq $pattern -or $file -like "*\$pattern") {
+            Write-Host "ERREUR : fichier sensible prêt à être envoyé : $file" -ForegroundColor Red
+            Write-Host "Annulation — vérifiez .gitignore."
+            git reset HEAD -- $file 2>$null
+            exit 1
+        }
+    }
+}
 git status
 
 $changes = git status --porcelain

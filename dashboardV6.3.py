@@ -84,6 +84,7 @@ from display_units import (
     TECHNICAL_FORMAT,
     TECHNICAL_LABELS,
     format_map_for_labeled_columns,
+    pick_existing_columns,
     rename_columns_for_display,
 )
 
@@ -1991,27 +1992,27 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                             "Rendements et volatilités en **%** · corrélations sur **0–1** · "
                             "Δ = impact simulé sur le portefeuille."
                         )
-                        st.dataframe(
-                            display_view.style.format(sugg_format, na_rep="-")
-                            .background_gradient(
-                                cmap="RdYlGn",
-                                subset=[
-                                    "Score composite (pts)",
-                                    "Score composite",
-                                    "Δ Rendement portef. (%)",
-                                    "Δ Rendement portef.",
-                                ],
-                            ).background_gradient(
-                                cmap="RdYlGn",
-                                subset=[
-                                    "Δ Volatilité portef. (%)",
-                                    "Δ Volatilité portef.",
-                                    "Δ Kurtosis portef.",
-                                    "Δ Corr. interne (0–1)",
-                                    "Δ Corr. interne",
-                                ],
-                            )
+                        styled_sugg = display_view.style.format(sugg_format, na_rep="-")
+                        grad_pos = pick_existing_columns(
+                            display_view,
+                            "Score composite (pts)",
+                            "Δ Rendement portef. (%)",
                         )
+                        if grad_pos:
+                            styled_sugg = styled_sugg.background_gradient(
+                                cmap="RdYlGn", subset=grad_pos
+                            )
+                        grad_neg = pick_existing_columns(
+                            display_view,
+                            "Δ Volatilité portef. (%)",
+                            "Δ Kurtosis portef.",
+                            "Δ Corr. interne (0–1)",
+                        )
+                        if grad_neg:
+                            styled_sugg = styled_sugg.background_gradient(
+                                cmap="RdYlGn", subset=grad_neg
+                            )
+                        st.dataframe(styled_sugg)
 
                         st.markdown("### Visualisation des compromis")
                         plot_df = suggestions.head(min(50, len(suggestions))).copy()

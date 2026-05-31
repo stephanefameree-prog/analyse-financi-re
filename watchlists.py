@@ -10,6 +10,7 @@ from display_units import (
     WATCHLIST_FORMAT,
     WATCHLIST_LABELS,
     format_map_for_labeled_columns,
+    pick_existing_columns,
     rename_columns_for_display,
 )
 
@@ -346,7 +347,10 @@ def render_watchlist_dashboard(prices, ticker_names, show_company_names, watchli
     )
     st.dataframe(
         view_display.style.format(watchlist_format, na_rep="-")
-        .background_gradient(cmap="RdYlGn", subset=["Score global (pts)", "Score global"]),
+        .background_gradient(
+            cmap="RdYlGn",
+            subset=pick_existing_columns(view_display, "Score global (pts)", "Score global"),
+        ),
         use_container_width=True,
         height=min(600, 38 + 35 * len(view_display)),
     )

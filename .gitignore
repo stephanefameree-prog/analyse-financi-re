@@ -1,7 +1,8 @@
-# Données personnelles (ne jamais publier)
+# Données personnelles (ne jamais publier — dépôt public)
 mon_portefeuille.csv
 watchlists.json
-
+**/mon_portefeuille.csv
+**/watchlists.json
 # Caches calculés (régénérables)
 dividendes_cache.json
 dividendes_universe.json

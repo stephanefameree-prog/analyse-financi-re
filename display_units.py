@@ -288,6 +288,13 @@ def rename_columns_for_display(df, label_map):
     return df.rename(columns=mapping)
 
 
+def pick_existing_columns(df, *column_names):
+    """Colonnes présentes dans df (pour subset Styler / background_gradient)."""
+    if df is None or df.empty:
+        return []
+    return [c for c in column_names if c in df.columns]
+
+
 def pick_format(df, format_map):
     """Ne garde que les formats dont la colonne existe (noms déjà renommés ou bruts)."""
     return {k: v for k, v in format_map.items() if k in df.columns}

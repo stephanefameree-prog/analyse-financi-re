@@ -42,6 +42,26 @@ copy mon_portefeuille.csv.example mon_portefeuille.csv
 pytest tests/
 ```
 
+## Confidentialité et dépôt public
+
+Ce dépôt est conçu pour être **public** : seul le **code** est partagé, pas vos données personnelles.
+
+| Fichier | Sur GitHub ? | Contenu |
+|---------|--------------|---------|
+| `mon_portefeuille.csv` | **Non** (`.gitignore`) | Vos quantités et PRU |
+| `watchlists.json` | **Non** | Vos listes perso |
+| `*_cache.json` | **Non** | Caches Yahoo recalculables |
+| `mon_portefeuille.csv.example` | **Oui** | Fichier fictif d'exemple |
+| `tickers.json` | **Oui** | Listes de tickers publiques (BFM, indices…) |
+
+**Vérification avant chaque push :** le script `publier_github.ps1` refuse d'envoyer des fichiers sensibles.
+
+Chaque utilisateur qui clone le dépôt crée **son propre** `mon_portefeuille.csv` en local :
+
+```bash
+copy mon_portefeuille.csv.example mon_portefeuille.csv
+```
+
 ## Publier sur GitHub
 
 1. Installer [Git for Windows](https://git-scm.com/download/win)
@@ -55,6 +75,6 @@ cd "chemin\vers\analyse financiere"
 
 Ou suivre les commandes affichées par le script.
 
-## Confidentialité
+## Confidentialité (rappel)
 
-Ne commitez **jamais** `mon_portefeuille.csv`, `watchlists.json` ni les fichiers `*_cache.json` (déjà exclus via `.gitignore`).
+Ne commitez **jamais** `mon_portefeuille.csv`, `watchlists.json` ni les fichiers `*_cache.json`.
