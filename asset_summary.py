@@ -10,7 +10,10 @@ from display_units import (
     pick_existing_columns,
     rename_columns_for_display,
 )
-from fundamentals import compute_market_indicators, fetch_fundamentals_for_ticker
+from fundamentals import (
+    compute_market_indicators,
+    cached_fetch_fundamentals_for_ticker,
+)
 
 
 def _score_from_votes(votes):
@@ -176,10 +179,6 @@ def combine_valuation_verdict(funda_score, tech_score):
     return combined, _label_from_score(combined)
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def cached_fundamentals_for_summary(ticker, last_price):
-    return fetch_fundamentals_for_ticker(ticker, last_price, throttle=False)
-
 
 def build_asset_summary_table(prices, rsi_period=14):
     last_prices = prices.iloc[-1]
@@ -189,7 +188,9 @@ def build_asset_summary_table(prices, rsi_period=14):
     rows = []
     for ticker in prices.columns:
         lp = float(last_prices[ticker]) if not np.isnan(last_prices[ticker]) else None
-        funda_row = cached_fundamentals_for_summary(ticker, lp) or {}
+        funda_row = cached_fetch_fundamentals_for_ticker(
+            ticker, round(float(lp), 4) if lp is not None else -1.0
+        ) or {}
         funda_row.update(_price_stats_from_series(prices[ticker], lp, ticker=ticker))
 
         tech_row = tech_by_ticker.loc[ticker].to_dict() if ticker in tech_by_ticker.index else {}
@@ -225,6 +226,12 @@ def build_asset_summary_table(prices, rsi_period=14):
     return df
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_build_asset_summary_table(prices_sig, rsi_period, prices):
+    return build_asset_summary_table(prices, rsi_period=rsi_period)
+
+
+@st.fragment
 def render_asset_summary_dashboard(prices):
     st.subheader("Synthèse par actif : bon marché ou cher ?")
     st.caption(
@@ -236,9 +243,12 @@ def render_asset_summary_dashboard(prices):
     run = st.button("Générer la synthèse", type="primary", key="summary_run")
 
     cache_key = f"asset_summary_{abs(hash('|'.join(prices.columns)))}_{rsi_period}"
+    prices_sig = "|".join(sorted(str(c) for c in prices.columns))
     if run:
         with st.spinner("Analyse fondamentale et technique en cours..."):
-            st.session_state[cache_key] = build_asset_summary_table(prices, rsi_period=rsi_period)
+            st.session_state[cache_key] = cached_build_asset_summary_table(
+                prices_sig, rsi_period, prices
+            )
 
     df = st.session_state.get(cache_key)
     if df is None or df.empty:

@@ -78,3 +78,9 @@ Ou suivre les commandes affichées par le script.
 ## Confidentialité (rappel)
 
 Ne commitez **jamais** `mon_portefeuille.csv`, `watchlists.json` ni les fichiers `*_cache.json`.
+
+## Licence
+
+© 2026 **Stéphane Famerée**. Distribué sous licence [MIT](LICENSE).
+
+Cet outil est fourni **à titre informatif uniquement** ; il ne constitue pas un conseil en investissement. Les données de marché proviennent de tiers (ex. Yahoo Finance) et restent soumises à leurs conditions d'utilisation.

@@ -39,10 +39,11 @@ def _load_fundamentals_disk_store():
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict) and isinstance(data.get("portfolios"), dict):
+            data.setdefault("tickers", {})
             return data
     except Exception:
         pass
-    return {"version": 1, "portfolios": {}}
+    return {"version": 1, "portfolios": {}, "tickers": {}}
 
 
 def _save_fundamentals_disk_store(data):
@@ -75,6 +76,29 @@ def save_fundamentals_rows_to_disk(ticker_signature, rows):
     store.setdefault("portfolios", {})[ticker_signature] = {
         "updated_at": datetime.now().isoformat(timespec="seconds"),
         "rows": rows,
+    }
+    _save_fundamentals_disk_store(store)
+
+
+def load_fundamental_ticker_from_disk(ticker):
+    """Charge les fondamentaux d'un ticker depuis le cache disque (TTL 24 h)."""
+    entry = _load_fundamentals_disk_store().get("tickers", {}).get(ticker)
+    if not entry:
+        return None
+    row = entry.get("row") if isinstance(entry, dict) else entry
+    if row and _row_is_fresh(row):
+        return row
+    return None
+
+
+def save_fundamental_ticker_to_disk(ticker, row):
+    """Enregistre les fondamentaux d'un ticker sur le disque."""
+    if not row:
+        return
+    store = _load_fundamentals_disk_store()
+    store.setdefault("tickers", {})[ticker] = {
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "row": row,
     }
     _save_fundamentals_disk_store(store)
 
@@ -682,6 +706,63 @@ def _normalize_yahoo_pct(value):
     return v
 
 
+def _normalize_yahoo_change_pct(value):
+    """
+    regularMarketChangePercent Yahoo : toujours en points de % (-0,37 = -0,37 %, 2,5 = +2,5 %).
+    Ne pas réutiliser _normalize_yahoo_pct (seuil 0,5) : les petites variations seraient ×100.
+    """
+    v = _safe_float(value)
+    if v is None:
+        return None
+    return v / 100.0
+
+
+def _fix_legacy_daily_var(value):
+    """Corrige d'anciennes valeurs stockées ×100 (ex. -0,37 lues comme -37 %)."""
+    v = _safe_float(value)
+    if v is None:
+        return None
+    if 0.005 <= abs(v) < 0.5:
+        return v / 100.0
+    return v
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_yahoo_info(ticker):
+    try:
+        return dict(yf.Ticker(str(ticker)).info or {})
+    except Exception:
+        return {}
+
+
+def _daily_var_from_yahoo_or_prices(ticker, price_series=None, last_price=None):
+    """Variation du jour : Yahoo (prioritaire) puis clôture veille, puis historique OHLCV."""
+    info = _cached_yahoo_info(str(ticker)) if ticker else {}
+
+    daily = _normalize_yahoo_change_pct(info.get("regularMarketChangePercent"))
+    if daily is not None:
+        return daily
+
+    lp = _safe_float(last_price)
+    if lp is None:
+        lp = _safe_float(info.get("regularMarketPrice") or info.get("currentPrice"))
+
+    prev_close = _safe_float(info.get("regularMarketPreviousClose") or info.get("previousClose"))
+    if lp is not None and prev_close and prev_close > 0:
+        return (lp - prev_close) / prev_close
+
+    s = pd.Series(dtype=float)
+    if price_series is not None:
+        s = pd.to_numeric(price_series, errors="coerce").dropna()
+    if lp is None and not s.empty:
+        lp = float(s.iloc[-1])
+    if len(s) >= 2 and lp is not None:
+        prev = float(s.iloc[-2])
+        if prev > 0 and (s.index[-1] - s.index[-2]).days <= 4:
+            return (lp - prev) / prev
+    return None
+
+
 def _realized_volatility(price_series, trading_days):
     s = pd.to_numeric(price_series, errors="coerce").dropna()
     if len(s) < trading_days + 2:
@@ -714,9 +795,7 @@ def compute_market_indicators(ticker, price_series=None, last_price=None):
     metrics["Dernier cours"] = lp
     metrics["Prix"] = lp
 
-    daily = _normalize_yahoo_pct(info.get("regularMarketChangePercent"))
-    if daily is None and len(s) >= 2:
-        daily = float(s.iloc[-1] / s.iloc[-2] - 1)
+    daily = _daily_var_from_yahoo_or_prices(ticker, price_series=s, last_price=lp)
     metrics["Var. journalière (%)"] = daily
 
     window = s.tail(252) if len(s) >= 60 else s
@@ -768,6 +847,74 @@ def compute_market_indicators(ticker, price_series=None, last_price=None):
         metrics["Float / actions"] = float_sh / shares
 
     return metrics
+
+
+def _refresh_market_fields_from_prices(row, price_series, last_price=None, ticker=None):
+    """
+    Recalcule les colonnes marché depuis l'historique OHLCV + Yahoo (var. jour).
+    Corrige les valeurs en cache obsolètes ou erronées (×100).
+    """
+    row = dict(row)
+    ticker = ticker or row.get("Ticker")
+    if price_series is None:
+        daily = _daily_var_from_yahoo_or_prices(ticker, last_price=last_price)
+        if daily is None:
+            daily = _fix_legacy_daily_var(row.get("Var. journalière (%)"))
+        if daily is not None:
+            row["Var. journalière (%)"] = daily
+        return row
+
+    s = pd.to_numeric(price_series, errors="coerce").dropna()
+    if s.empty:
+        return row
+
+    lp = _safe_float(last_price)
+    if lp is None:
+        lp = float(s.iloc[-1])
+    row["Dernier cours"] = lp
+    row["Prix"] = lp
+
+    daily = _daily_var_from_yahoo_or_prices(ticker, price_series=s, last_price=lp)
+    if daily is None:
+        daily = _fix_legacy_daily_var(row.get("Var. journalière (%)"))
+    if daily is not None:
+        row["Var. journalière (%)"] = daily
+
+    window = s.tail(252) if len(s) >= 60 else s
+    if not window.empty:
+        high_52 = float(window.max())
+        low_52 = float(window.min())
+        row["Sommet 52 sem."] = high_52
+        row["Creux 52 sem."] = low_52
+        row["Max 52 sem."] = high_52
+        row["Min 52 sem."] = low_52
+        if high_52 > low_52:
+            row["Position 52 sem."] = (lp - low_52) / (high_52 - low_52)
+        if high_52 > 0:
+            row["Var. vs sommet 52 sem. (%)"] = (lp - high_52) / high_52
+        if low_52 > 0:
+            row["Var. vs creux 52 sem. (%)"] = (lp - low_52) / low_52
+
+    if len(s) >= 252:
+        row["Variation 1 an"] = float(lp / float(s.iloc[-252]) - 1)
+
+    sma50 = compute_sma(s, 50)
+    sma200 = compute_sma(s, 200)
+    if not sma50.empty:
+        m50 = float(sma50.iloc[-1])
+        if m50 > 0:
+            row["Prix % MA50"] = lp / m50 * 100.0
+    if not sma200.empty:
+        m200 = float(sma200.iloc[-1])
+        if m200 > 0:
+            row["Prix % MA200"] = lp / m200 * 100.0
+
+    for days, col in ((30, "Volat. réalisée 30j"), (90, "Volat. réalisée 90j"), (252, "Volat. réalisée 1 an")):
+        vol = _realized_volatility(s, days)
+        if vol is not None:
+            row[col] = vol
+
+    return row
 
 
 def fetch_fundamentals_for_ticker(ticker, last_price, price_series=None, throttle=True):
@@ -872,6 +1019,13 @@ def fetch_fundamentals_for_ticker(ticker, last_price, price_series=None, throttl
         "_fetched_at": datetime.now().isoformat(timespec="seconds"),
     }
     return row
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def cached_fetch_fundamentals_for_ticker(ticker, last_price_key):
+    """Cache mémoire par ticker (complète le cache disque). last_price_key = round(prix, 4) ou -1."""
+    lp = None if last_price_key is None or last_price_key < 0 else float(last_price_key)
+    return fetch_fundamentals_for_ticker(ticker, lp, throttle=False)
 
 
 FUNDAMENTALS_PERCENT_COLUMNS = frozenset({
@@ -1186,6 +1340,172 @@ def _fundamentals_metric_sentiment(column, val):
     return ""
 
 
+_NEGATIVE_RATIO_HINTS = {
+    "PER": "PER négatif : bénéfice net < 0 (pertes). Le multiple n'est pas comparable à un PER classique.",
+    "PER forward": "PER forward négatif : bénéfice anticipé < 0.",
+    "VE/EBITDA": "VE/EBITDA négatif : EBITDA ≤ 0 (pas de cash opérationnel avant amortissements).",
+    "VE/EBITDA forward": "VE/EBITDA forward négatif : EBITDA anticipé ≤ 0.",
+    "VE/EBIT": "VE/EBIT négatif : résultat opérationnel ≤ 0.",
+    "VE/FCF": "VE/FCF négatif : free cash-flow ≤ 0.",
+    "Ratio PEG": "PEG négatif ou peu fiable : croissance ou bénéfice négatif.",
+    "PEG forward": "PEG forward négatif : idem sur anticipations.",
+    "Cours / val. comptable": "P/B négatif : fonds propres comptables < 0.",
+    "Cours / val. comptable tangible": "P/B tangible négatif : fonds propres tangibles < 0.",
+}
+
+_FUNDAMENTALS_COLUMN_HELP = {
+    "Collecte fondamentaux": "Date/heure du dernier téléchargement des ratios comptables (Yahoo). Cache disque 24 h.",
+    "Notes interprétation": "Alertes sur ratios non comparables (pertes, EBITDA négatif, etc.).",
+    "Var. journalière (%)": "Variation vs clôture veille (Yahoo). Distinct de la volatilité 1 an.",
+    "Volat. réalisée 1 an (%, ann.)": "Amplitude des mouvements quotidiens annualisée — ce n'est pas la variation du jour.",
+    "PER (×)": "Cours ÷ bénéfice par action. Négatif si l'entreprise est déficitaire.",
+    "PER forward (×)": "Cours ÷ bénéfice anticipé. Négatif si pertes anticipées.",
+    "VE/EBITDA (×)": "Valeur d'entreprise ÷ EBITDA. Négatif si EBITDA ≤ 0.",
+    "VE/EBITDA forward (×)": "Idem sur EBITDA anticipé.",
+}
+
+
+def _format_collecte_timestamp(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "—"
+    try:
+        return datetime.fromisoformat(str(value)).strftime("%d/%m/%Y %H:%M")
+    except (TypeError, ValueError):
+        return str(value)[:16]
+
+
+def _fundamental_metric_hint(column, raw_value):
+    column = internal_column_name(column, FUNDAMENTALS_LABELS)
+    v = _safe_float(raw_value)
+    if v is None:
+        return None
+    if column in _NEGATIVE_RATIO_HINTS and v < 0:
+        return _NEGATIVE_RATIO_HINTS[column]
+    if "Marge" in column and v < -0.5:
+        return "Marge très négative : pertes nettes ou opérationnelles >> chiffre d'affaires."
+    if column == "ROE" and v < 0:
+        return "ROE négatif : fonds propres ou résultat net négatif sur la période."
+    return None
+
+
+def _fundamental_row_notes(row):
+    notes = []
+    if hasattr(row, "get"):
+        getter = row.get
+    else:
+        getter = lambda k, default=None: row[k] if k in row.index else default
+
+    for col, hint in _NEGATIVE_RATIO_HINTS.items():
+        v = _safe_float(getter(col))
+        if v is not None and v < 0:
+            short = hint.split(" : ", 1)[0]
+            notes.append(short)
+
+    for col in ("Marge nette", "Marge EBITDA", "Marge exploitation"):
+        v = _safe_float(getter(col))
+        if v is not None and v < -0.5:
+            notes.append("Marges très négatives (pertes >> CA)")
+            break
+
+    roe = _safe_float(getter("ROE"))
+    if roe is not None and roe < 0:
+        notes.append("ROE négatif")
+
+    if not notes:
+        return "—"
+    return " · ".join(dict.fromkeys(notes))
+
+
+def _fundamentals_table_column_config(df_display):
+    config = {}
+    for col in df_display.columns:
+        help_text = _FUNDAMENTALS_COLUMN_HELP.get(col)
+        if help_text:
+            config[col] = st.column_config.TextColumn(help=help_text)
+    return config
+
+
+def _format_fundamental_value(col, val):
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return "-"
+    if col in FUNDAMENTALS_PERCENT_COLUMNS:
+        return f"{val:.2%}"
+    if col in FUNDAMENTALS_LARGE_MONEY_COLUMNS:
+        return f"{val:,.0f}"
+    if col in FUNDAMENTALS_MONEY_COLUMNS:
+        return f"{val:,.0f}"
+    if col in FUNDAMENTALS_SHARE_COLUMNS:
+        return f"{val:,.0f}"
+    if col in FUNDAMENTALS_PRICE_COLUMNS:
+        return f"{val:.2f}"
+    if col in FUNDAMENTALS_MA_PCT_COLUMNS:
+        return f"{val:.1f}"
+    if col == "Score Piotroski":
+        return f"{val:.0f} / 9"
+    if col in FUNDAMENTALS_RATIO_COLUMNS:
+        return f"{val:.2f}"
+    return f"{val:.2f}"
+
+
+def _render_fundamental_metric(label, column, raw_value, formatted=None):
+    """Affiche une métrique Streamlit avec code couleur vert / rouge."""
+    formatted = formatted if formatted is not None else _format_fundamental_value(column, raw_value)
+    style = _fundamentals_metric_sentiment(column, raw_value)
+    if not style:
+        st.metric(label, formatted)
+        hint = _fundamental_metric_hint(column, raw_value)
+        if hint:
+            st.caption(hint)
+        return
+    st.markdown(
+        f'<div style="margin-bottom: 0.35rem;">'
+        f'<div style="font-size: 0.875rem; line-height: 1.25; color: rgb(49, 51, 63); opacity: 0.8;">'
+        f"{label}</div>"
+        f'<div style="font-size: 1.75rem; font-weight: 600; line-height: 1.2; {style} '
+        f'padding: 0.2rem 0.55rem; border-radius: 0.35rem; display: inline-block;">'
+        f"{formatted}</div></div>",
+        unsafe_allow_html=True,
+    )
+    hint = _fundamental_metric_hint(column, raw_value)
+    if hint:
+        st.caption(hint)
+
+
+def _render_fundamentals_detail_table(row, cols):
+    """Tableau détaillé avec code couleur par indicateur."""
+    entries = []
+    for col in cols:
+        if col not in row.index:
+            continue
+        raw = row[col]
+        hint = _fundamental_metric_hint(col, raw)
+        entries.append(
+            {
+                "Indicateur": FUNDAMENTALS_LABELS.get(col, col),
+                "Valeur": _format_fundamental_value(col, raw),
+                "Interprétation": hint or "—",
+                "_col": col,
+                "_raw": raw,
+            }
+        )
+    if not entries:
+        return
+    detail_df = pd.DataFrame(entries)
+
+    def _color_detail_row(series):
+        idx = series.name
+        style = _fundamentals_metric_sentiment(
+            detail_df.loc[idx, "_col"],
+            detail_df.loc[idx, "_raw"],
+        )
+        return ["", style, ""]
+
+    styled = detail_df[["Indicateur", "Valeur", "Interprétation"]].style.apply(
+        _color_detail_row, axis=1
+    )
+    st.dataframe(styled, hide_index=True, use_container_width=True)
+
+
 def _style_fundamentals_sentiment(styler):
     def _color_column(series):
         if series.name not in _FUNDAMENTALS_SENTIMENT_COLUMNS:
@@ -1193,6 +1513,110 @@ def _style_fundamentals_sentiment(styler):
         return [_fundamentals_metric_sentiment(series.name, v) for v in series]
 
     return styler.apply(_color_column, axis=0)
+
+
+style_fundamentals_sentiment = _style_fundamentals_sentiment
+
+SUGGESTION_QUALITY_COLUMNS = (
+    "Score Piotroski",
+    "ROE",
+    "ROIC",
+    "Marge nette (moy. 5 ans)",
+    "PER",
+    "Ratio PEG",
+    "Dette / Capitaux",
+    "Dette / FCF",
+    "Upside vs objectif",
+    "Recommandation",
+)
+
+
+def fetch_fundamentals_for_tickers(
+    tickers,
+    prices,
+    cache=None,
+    progress_cb=None,
+    use_disk_cache=True,
+):
+    """Collecte les fondamentaux (session + disque 24 h, puis Yahoo)."""
+    cache = cache if cache is not None else {}
+    rows = []
+    stats = {"session": 0, "disk": 0, "fetched": 0, "missing": 0}
+    tickers = [t for t in dict.fromkeys(tickers) if t]
+    for i, t in enumerate(tickers):
+        if progress_cb:
+            progress_cb(t, i + 1, len(tickers), stats)
+        cached = cache.get(t)
+        if cached and _row_is_fresh(cached):
+            rows.append(cached)
+            stats["session"] += 1
+            continue
+        if use_disk_cache:
+            disk_row = load_fundamental_ticker_from_disk(t)
+            if disk_row is not None:
+                cache[t] = disk_row
+                rows.append(disk_row)
+                stats["disk"] += 1
+                continue
+        lp = None
+        price_series = None
+        if prices is not None and t in prices.columns:
+            price_series = prices[t]
+            s = price_series.dropna()
+            if len(s):
+                lp = float(s.iloc[-1])
+        row = fetch_fundamentals_for_ticker(t, lp, price_series=price_series)
+        if row is not None:
+            cache[t] = row
+            if use_disk_cache:
+                save_fundamental_ticker_to_disk(t, row)
+            rows.append(row)
+            stats["fetched"] += 1
+        else:
+            stats["missing"] += 1
+    return rows, cache, stats
+
+
+def merge_fundamentals_columns(df, fundamentals_rows, columns=None):
+    """Joint les indicateurs fondamentaux au tableau de suggestions (clé Ticker)."""
+    if df is None or df.empty or not fundamentals_rows:
+        return df
+    columns = columns or SUGGESTION_QUALITY_COLUMNS
+    fund_df = pd.DataFrame(fundamentals_rows)
+    if fund_df.empty or "Ticker" not in fund_df.columns:
+        return df
+    keep = ["Ticker"] + [c for c in columns if c in fund_df.columns]
+    fund_df = fund_df[keep].drop_duplicates(subset=["Ticker"], keep="last")
+    merged = df.merge(fund_df, on="Ticker", how="left")
+    return merged
+
+
+def filter_suggestions_by_quality(
+    df,
+    min_piotroski=0,
+    min_roe=0.0,
+    max_per=None,
+    max_debt_equity=None,
+):
+    """Filtre les suggestions selon des seuils de qualité fondamentale."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if min_piotroski > 0 and "Score Piotroski" in out.columns:
+        out = out[out["Score Piotroski"].fillna(-1) >= min_piotroski]
+    if min_roe > 0 and "ROE" in out.columns:
+        out = out[out["ROE"].fillna(-1) >= min_roe]
+    if max_per is not None and "PER" in out.columns:
+        out = out[
+            out["PER"].isna()
+            | ((out["PER"] > 0) & (out["PER"] <= max_per))
+        ]
+    if max_debt_equity is not None and "Dette / Capitaux" in out.columns:
+        out = out[
+            out["Dette / Capitaux"].isna()
+            | (out["Dette / Capitaux"] <= max_debt_equity)
+        ]
+    return out
 
 
 def _render_fundamentals_legend():
@@ -1217,7 +1641,19 @@ sont des **repères pédagogiques**, pas des règles absolues — à adapter au 
 | **Prix % MA50 / MA200** | Cours ÷ moyenne mobile (× 100) | **100** = sur la MM ; **> 100** = au-dessus (tendance haussière) ; **< 100** = en dessous. |
 | **Float / actions** | Part des titres réellement échangeables | Proche de **100 %** = flottant élevé ; faible = titres « bloqués » (fondateurs, État…). |
 | **Actions en circulation** | Nombre total d'actions émises | Utile pour la capitalisation (cours × actions). |
-| **Volat. réalisée 30j / 90j / 1 an** | Écart-type des rendements quotidiens, annualisé | Mesure l'**amplitude réelle** des mouvements ; faible = titre calme. |
+| **Volat. réalisée 30j / 90j / 1 an** | Écart-type des rendements quotidiens, annualisé | Mesure l'**amplitude réelle** des mouvements ; faible = titre calme. **≠ var. journalière.** |
+
+| **Collecte fondamentaux** | Date du dernier téléchargement Yahoo (ratios comptables) | Cache **24 h** ; cours / var. jour recalculés à chaque affichage. |
+| **Notes interprétation** | Alertes par titre | Signale PER, VE/EBITDA ou marges **non comparables** (souvent pertes). |
+
+### Ratios négatifs — comment les lire
+
+| Ratio négatif | Signification habituelle |
+|---------------|-------------------------|
+| **PER / PER forward < 0** | Bénéfice (ou anticipé) **négatif** — pas « bon marché » au sens classique. |
+| **VE/EBITDA < 0** | **EBITDA ≤ 0** : pas de base de cash opérationnel avant D&A. |
+| **P/B < 0** | **Fonds propres comptables négatifs** (passif > actif côté capitaux propres). |
+| **Marge << −100 %** | Pertes **supérieures au chiffre d'affaires** sur la période (fréquent en biotech / early stage). |
 
 *Historique recommandé : ≥ 1 an pour les extrêmes 52 semaines et la volatilité 1 an ; ≥ 200 séances pour la MM200.*
 
@@ -1345,6 +1781,7 @@ Si le prix est **au-dessus** de l'objectif moyen, le titre est déjà « dans le
         )
 
 
+@st.fragment
 def render_fundamentals_dashboard(prices):
     st.subheader("Analyse fondamentale & consensus analystes")
     _render_fundamentals_legend()
@@ -1418,6 +1855,13 @@ def render_fundamentals_dashboard(prices):
         st.rerun()
     if reset:
         clear_fundamentals_disk_cache(signature)
+        try:
+            from dashboard_cache import clear_dashboard_compute_cache
+
+            clear_dashboard_compute_cache()
+        except ImportError:
+            pass
+        cached_fetch_fundamentals_for_ticker.clear()
         if cache_key in st.session_state:
             del st.session_state[cache_key]
         disk_loaded_key = f"{cache_key}_disk_loaded"
@@ -1471,9 +1915,31 @@ def render_fundamentals_dashboard(prices):
         )
         return
 
+    refreshed = []
+    for row in data:
+        ticker = row.get("Ticker")
+        if ticker in prices.columns:
+            lp = last_prices.get(ticker)
+            lp = float(lp) if lp is not None and not pd.isna(lp) else None
+            refreshed.append(
+                _refresh_market_fields_from_prices(
+                    row, prices[ticker], last_price=lp, ticker=ticker
+                )
+            )
+        else:
+            refreshed.append(dict(row))
+    data = refreshed
+
     df = pd.DataFrame(data)
     if "_fetched_at" in df.columns:
+        df["Collecte Yahoo"] = df["_fetched_at"].apply(_format_collecte_timestamp)
         df = df.drop(columns=["_fetched_at"])
+    else:
+        df["Collecte Yahoo"] = "—"
+    df["Notes interprétation"] = df.apply(_fundamental_row_notes, axis=1)
+    meta_cols = ["Ticker", "Collecte Yahoo", "Notes interprétation"]
+    other_cols = [c for c in df.columns if c not in meta_cols]
+    df = df[meta_cols + other_cols]
     sort_options = [
         "PER",
         "VE/EBITDA",
@@ -1522,9 +1988,14 @@ def render_fundamentals_dashboard(prices):
     )
     st.caption(FUNDAMENTALS_CAPTION)
     st.caption(
-        "Couleurs : vert = favorable, rouge = défavorable (seuils détaillés dans la légende 📖)."
+        "Couleurs : vert = favorable, rouge = défavorable (seuils détaillés dans la légende 📖). "
+        "Survolez les en-têtes **PER**, **VE/EBITDA**, **Collecte** pour l'aide contextuelle."
     )
-    st.dataframe(styled, use_container_width=True)
+    st.dataframe(
+        styled,
+        use_container_width=True,
+        column_config=_fundamentals_table_column_config(df_display),
+    )
 
     csv = df_display.to_csv(index=False).encode("utf-8")
     st.download_button("Telecharger (CSV)", csv, "analyse_fondamentale.csv")
@@ -1532,29 +2003,32 @@ def render_fundamentals_dashboard(prices):
     st.markdown("---")
     detail = st.selectbox("Detail par actif", df["Ticker"])
     row = df[df["Ticker"] == detail].iloc[0]
+    if row.get("Notes interprétation") not in (None, "—", ""):
+        st.info(f"**{detail}** — {row['Notes interprétation']}")
+    if row.get("Collecte Yahoo") not in (None, "—", ""):
+        st.caption(
+            f"Collecte fondamentaux Yahoo : **{row['Collecte Yahoo']}** · "
+            "Cours, var. journalière et volatilités : recalculés à l'affichage."
+        )
+    st.caption(
+        "Code couleur par indicateur : **vert** = repère favorable · **rouge** = repère "
+        "défavorable (seuils dans la légende 📖). Sans couleur = neutre ou non applicable."
+    )
 
     st.markdown("#### Marché & technique")
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric(
-        "Dernier cours",
-        "-" if pd.isna(row.get("Dernier cours")) else f"{row['Dernier cours']:.2f}",
-    )
-    m2.metric(
-        "Var. jour",
-        "-"
-        if pd.isna(row.get("Var. journalière (%)"))
-        else f"{row['Var. journalière (%)']:.2%}",
-    )
-    m3.metric(
-        "Prix % MA200",
-        "-" if pd.isna(row.get("Prix % MA200")) else f"{row['Prix % MA200']:.1f}",
-    )
-    m4.metric(
-        "Volat. 1 an",
-        "-"
-        if pd.isna(row.get("Volat. réalisée 1 an"))
-        else f"{row['Volat. réalisée 1 an']:.2%}",
-    )
+    with m1:
+        _render_fundamental_metric("Dernier cours", "Dernier cours", row.get("Dernier cours"))
+    with m2:
+        _render_fundamental_metric(
+            "Var. jour", "Var. journalière (%)", row.get("Var. journalière (%)")
+        )
+    with m3:
+        _render_fundamental_metric("Prix % MA200", "Prix % MA200", row.get("Prix % MA200"))
+    with m4:
+        _render_fundamental_metric(
+            "Volat. 1 an", "Volat. réalisée 1 an", row.get("Volat. réalisée 1 an")
+        )
 
     with st.expander("Tous les indicateurs marché", expanded=False):
         market_cols = [
@@ -1572,34 +2046,20 @@ def render_fundamentals_dashboard(prices):
             "Volat. réalisée 90j",
             "Volat. réalisée 1 an",
         ]
-        market_data = {}
-        for col in market_cols:
-            if col not in row.index:
-                continue
-            val = row[col]
-            if pd.isna(val):
-                market_data[col] = "-"
-            elif col in FUNDAMENTALS_PERCENT_COLUMNS:
-                market_data[col] = f"{val:.2%}"
-            elif col in FUNDAMENTALS_MA_PCT_COLUMNS:
-                market_data[col] = f"{val:.1f}"
-            elif col in FUNDAMENTALS_SHARE_COLUMNS:
-                market_data[col] = f"{val:,.0f}"
-            elif col in FUNDAMENTALS_PRICE_COLUMNS:
-                market_data[col] = f"{val:.2f}"
-            else:
-                market_data[col] = f"{val:.2f}"
-        st.table(pd.DataFrame([market_data]).T.rename(columns={0: detail}))
+        _render_fundamentals_detail_table(row, market_cols)
 
     st.markdown("#### Rentabilité & efficacité")
     r1, r2, r3, r4 = st.columns(4)
-    r1.metric("ROIC", "-" if pd.isna(row.get("ROIC")) else f"{row['ROIC']:.2%}")
-    r2.metric("ROE", "-" if pd.isna(row.get("ROE")) else f"{row['ROE']:.2%}")
-    r3.metric(
-        "Score Piotroski",
-        "-" if pd.isna(row.get("Score Piotroski")) else f"{row['Score Piotroski']:.0f} / 9",
-    )
-    r4.metric("Marge nette", "-" if pd.isna(row.get("Marge nette")) else f"{row['Marge nette']:.2%}")
+    with r1:
+        _render_fundamental_metric("ROIC", "ROIC", row.get("ROIC"))
+    with r2:
+        _render_fundamental_metric("ROE", "ROE", row.get("ROE"))
+    with r3:
+        _render_fundamental_metric(
+            "Score Piotroski", "Score Piotroski", row.get("Score Piotroski")
+        )
+    with r4:
+        _render_fundamental_metric("Marge nette", "Marge nette", row.get("Marge nette"))
 
     with st.expander("Tous les ratios rentabilité", expanded=False):
         prof_cols = [
@@ -1624,38 +2084,18 @@ def render_fundamentals_dashboard(prices):
             "Revenu / employé",
             "Bn net / employé",
         ]
-        prof_data = {}
-        for col in prof_cols:
-            if col not in row.index:
-                continue
-            val = row[col]
-            if pd.isna(val):
-                prof_data[col] = "-"
-            elif col in FUNDAMENTALS_PERCENT_COLUMNS:
-                prof_data[col] = f"{val:.2%}"
-            elif col in FUNDAMENTALS_MONEY_COLUMNS:
-                prof_data[col] = f"{val:,.0f}"
-            elif col == "Score Piotroski":
-                prof_data[col] = f"{val:.0f} / 9"
-            else:
-                prof_data[col] = f"{val:.2f}"
-        st.table(pd.DataFrame([prof_data]).T.rename(columns={0: detail}))
+        _render_fundamentals_detail_table(row, prof_cols)
 
     st.markdown("#### Valorisation (multiples & rendements)")
     v1, v2, v3, v4 = st.columns(4)
-    v1.metric("PER", "-" if pd.isna(row.get("PER")) else f"{row['PER']:.2f}")
-    v2.metric(
-        "VE/EBITDA",
-        "-" if pd.isna(row.get("VE/EBITDA")) else f"{row['VE/EBITDA']:.2f}",
-    )
-    v3.metric(
-        "Rendement FCF",
-        "-" if pd.isna(row.get("Rendement FCF")) else f"{row['Rendement FCF']:.2%}",
-    )
-    v4.metric(
-        "Ratio PEG",
-        "-" if pd.isna(row.get("Ratio PEG")) else f"{row['Ratio PEG']:.2f}",
-    )
+    with v1:
+        _render_fundamental_metric("PER", "PER", row.get("PER"))
+    with v2:
+        _render_fundamental_metric("VE/EBITDA", "VE/EBITDA", row.get("VE/EBITDA"))
+    with v3:
+        _render_fundamental_metric("Rendement FCF", "Rendement FCF", row.get("Rendement FCF"))
+    with v4:
+        _render_fundamental_metric("Ratio PEG", "Ratio PEG", row.get("Ratio PEG"))
 
     with st.expander("Tous les multiples de valorisation", expanded=False):
         val_cols = [
@@ -1680,37 +2120,22 @@ def render_fundamentals_dashboard(prices):
             "VE/EBIT",
             "VE/FCF",
         ]
-        val_data = {}
-        for col in val_cols:
-            if col not in row.index:
-                continue
-            val = row[col]
-            if pd.isna(val):
-                val_data[col] = "-"
-            elif col in FUNDAMENTALS_LARGE_MONEY_COLUMNS:
-                val_data[col] = f"{val:,.0f}"
-            elif col in FUNDAMENTALS_PERCENT_COLUMNS:
-                val_data[col] = f"{val:.2%}"
-            elif col in FUNDAMENTALS_RATIO_COLUMNS:
-                val_data[col] = f"{val:.2f}"
-            else:
-                val_data[col] = f"{val:.2f}"
-        st.table(pd.DataFrame([val_data]).T.rename(columns={0: detail}))
+        _render_fundamentals_detail_table(row, val_cols)
 
     st.markdown("#### Consensus analystes")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("PER", "-" if pd.isna(row["PER"]) else f"{row['PER']:.2f}")
-    c2.metric("Dette / FCF", "-" if pd.isna(row["Dette / FCF"]) else f"{row['Dette / FCF']:.2f}")
-    c3.metric(
-        "Objectif",
-        "-" if pd.isna(row["Objectif analystes"]) else f"{row['Objectif analystes']:.2f}",
-    )
-    c4.metric(
-        "Upside",
-        "-"
-        if pd.isna(row["Upside vs objectif"])
-        else f"{row['Upside vs objectif']:.2%}",
-    )
+    with c1:
+        _render_fundamental_metric("PER", "PER", row.get("PER"))
+    with c2:
+        _render_fundamental_metric("Dette / FCF", "Dette / FCF", row.get("Dette / FCF"))
+    with c3:
+        _render_fundamental_metric(
+            "Objectif", "Objectif analystes", row.get("Objectif analystes")
+        )
+    with c4:
+        _render_fundamental_metric(
+            "Upside", "Upside vs objectif", row.get("Upside vs objectif")
+        )
     st.write(f"**Recommandation consensus :** {row.get('Recommandation', '-')}")
 
     if not pd.isna(row["Objectif bas"]) and not pd.isna(row["Objectif haut"]):

@@ -288,6 +288,136 @@ def _style_dividend_sentiment(styler):
     return styler.apply(_color_column, axis=0)
 
 
+style_dividend_sentiment = _style_dividend_sentiment
+
+SUGGESTION_DIVIDEND_COLUMNS = (
+    "Statut",
+    "Rendement",
+    "CAGR 5 ans",
+    "Années de croissance",
+    "Payout",
+    "FCF Payout",
+    "Ratio couverture",
+    "Ratio couverture FCF",
+    "Score",
+)
+
+
+def _normalize_suggestion_dividend_row(row):
+    if not row:
+        return None
+    out = dict(row)
+    payout = out.get("Payout")
+    fcf_payout = out.get("FCF Payout")
+    if payout and payout > 0:
+        out["Ratio couverture"] = 1.0 / payout
+    if fcf_payout and fcf_payout > 0:
+        out["Ratio couverture FCF"] = 1.0 / fcf_payout
+    out.setdefault("_fetched_at", datetime.now().isoformat(timespec="seconds"))
+    return out
+
+
+def fetch_dividends_for_tickers(
+    tickers,
+    prices,
+    cache=None,
+    progress_cb=None,
+    throttle=True,
+    use_disk_cache=True,
+):
+    """Collecte les indicateurs dividendes (session + disque 24 h, puis Yahoo)."""
+    cache = cache if cache is not None else {}
+    rows = []
+    stats = {"session": 0, "disk": 0, "fetched": 0, "missing": 0}
+    tickers = [t for t in dict.fromkeys(tickers) if t]
+    for i, t in enumerate(tickers):
+        if progress_cb:
+            progress_cb(t, i + 1, len(tickers), stats)
+        cached = cache.get(t)
+        if cached and _dividend_row_is_fresh(cached):
+            rows.append(cached)
+            stats["session"] += 1
+            continue
+        if use_disk_cache:
+            disk_row = load_dividend_ticker_from_disk(t)
+            if disk_row is not None:
+                cache[t] = disk_row
+                rows.append(disk_row)
+                stats["disk"] += 1
+                continue
+        if throttle and stats["fetched"] > 0:
+            time.sleep(random.uniform(0.15, 0.35))
+        lp = None
+        if prices is not None and t in prices.columns:
+            s = prices[t].dropna()
+            if len(s):
+                lp = float(s.iloc[-1])
+        if lp is None or lp <= 0:
+            stats["missing"] += 1
+            continue
+        row, _ = fetch_ticker_dividend_bundle(t, lp)
+        row = _normalize_suggestion_dividend_row(row)
+        if row is not None:
+            cache[t] = row
+            if use_disk_cache:
+                save_dividend_ticker_to_disk(t, row)
+            rows.append(row)
+            stats["fetched"] += 1
+        else:
+            stats["missing"] += 1
+    return rows, cache, stats
+
+
+def merge_dividend_columns(df, dividend_rows, columns=None):
+    """Joint les indicateurs dividendes au tableau de suggestions (clé Ticker)."""
+    if df is None or df.empty or not dividend_rows:
+        return df
+    columns = columns or SUGGESTION_DIVIDEND_COLUMNS
+    div_df = pd.DataFrame(dividend_rows)
+    if div_df.empty or "Ticker" not in div_df.columns:
+        return df
+    keep = ["Ticker"] + [c for c in columns if c in div_df.columns]
+    div_df = div_df[keep].drop_duplicates(subset=["Ticker"], keep="last")
+    return df.merge(div_df, on="Ticker", how="left")
+
+
+def filter_suggestions_by_dividends(
+    df,
+    min_yield=None,
+    max_yield=None,
+    min_coverage=None,
+    min_cagr_5y=None,
+    min_growth_years=None,
+    max_payout=None,
+    max_fcf_payout=None,
+    active_only=False,
+    min_score=None,
+):
+    """Filtre les suggestions selon des seuils dividendes."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if active_only and "Statut" in out.columns:
+        out = out[out["Statut"] == "Actif"]
+    if min_yield is not None and "Rendement" in out.columns:
+        out = out[out["Rendement"].fillna(-1) >= min_yield]
+    if max_yield is not None and "Rendement" in out.columns:
+        out = out[out["Rendement"].isna() | (out["Rendement"] <= max_yield)]
+    if min_coverage is not None and "Ratio couverture" in out.columns:
+        out = out[out["Ratio couverture"].fillna(-1) >= min_coverage]
+    if min_cagr_5y is not None and "CAGR 5 ans" in out.columns:
+        out = out[out["CAGR 5 ans"].fillna(-1) >= min_cagr_5y]
+    if min_growth_years is not None and "Années de croissance" in out.columns:
+        out = out[out["Années de croissance"].fillna(-1) >= min_growth_years]
+    if max_payout is not None and "Payout" in out.columns:
+        out = out[out["Payout"].isna() | (out["Payout"] <= max_payout)]
+    if max_fcf_payout is not None and "FCF Payout" in out.columns:
+        out = out[out["FCF Payout"].isna() | (out["FCF Payout"] <= max_fcf_payout)]
+    if min_score is not None and "Score" in out.columns:
+        out = out[out["Score"].fillna(-1) >= min_score]
+    return out
+
+
 DIVIDENDS_DISK_CACHE_FILE = "dividendes_cache.json"
 DIVIDENDS_UNIVERSE_FILE = "dividendes_universe.json"
 DISK_CACHE_TTL_SECONDS = 86400
@@ -357,10 +487,11 @@ def _load_dividends_disk_store():
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict) and isinstance(data.get("portfolios"), dict):
+            data.setdefault("tickers", {})
             return data
     except Exception:
         pass
-    return {"version": 1, "portfolios": {}}
+    return {"version": 1, "portfolios": {}, "tickers": {}}
 
 
 def _save_dividends_disk_store(data):
@@ -394,6 +525,39 @@ def save_dividends_rows_to_disk(ticker_signature, rows):
     store.setdefault("portfolios", {})[ticker_signature] = {
         "updated_at": datetime.now().isoformat(timespec="seconds"),
         "rows": rows,
+    }
+    _save_dividends_disk_store(store)
+
+
+def _dividend_row_is_fresh(row, ttl_seconds=DISK_CACHE_TTL_SECONDS):
+    ts = row.get("_fetched_at") if row else None
+    if not ts:
+        return False
+    try:
+        return (datetime.now() - datetime.fromisoformat(ts)).total_seconds() <= ttl_seconds
+    except Exception:
+        return False
+
+
+def load_dividend_ticker_from_disk(ticker):
+    """Charge les dividendes d'un ticker depuis le cache disque (TTL 24 h)."""
+    entry = _load_dividends_disk_store().get("tickers", {}).get(ticker)
+    if not entry:
+        return None
+    row = entry.get("row") if isinstance(entry, dict) else entry
+    if row and _dividend_row_is_fresh(row):
+        return row
+    return None
+
+
+def save_dividend_ticker_to_disk(ticker, row):
+    """Enregistre les dividendes d'un ticker sur le disque."""
+    if not row:
+        return
+    store = _load_dividends_disk_store()
+    store.setdefault("tickers", {})[ticker] = {
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "row": row,
     }
     _save_dividends_disk_store(store)
 
@@ -922,6 +1086,7 @@ def process_dividend_universe_batch(
     limit=None,
     sleep_seconds=0.25,
     save_every=20,
+    progress_callback=None,
 ):
     """Traite un lot de tickers et met à jour dividendes_universe.json."""
     universe = universe or load_dividend_universe()
@@ -935,6 +1100,7 @@ def process_dividend_universe_batch(
         pending = pending[:limit]
 
     processed_now = 0
+    batch_total = len(pending)
     for i, ticker in enumerate(pending):
         if i > 0 and sleep_seconds:
             time.sleep(random.uniform(sleep_seconds * 0.6, sleep_seconds * 1.4))
@@ -944,6 +1110,8 @@ def process_dividend_universe_batch(
         except Exception as exc:
             universe["failed_tickers"][ticker] = str(exc)
         processed_now += 1
+        if progress_callback and batch_total:
+            progress_callback((i + 1) / batch_total, ticker, processed_now, batch_total)
         if processed_now % save_every == 0:
             meta["with_dividends"] = sum(
                 1 for r in universe["tickers"].values() if r.get("A des dividendes")
@@ -1247,6 +1415,7 @@ def _render_dividend_universe_section(portfolio_tickers=None):
     c2.metric("Traités", n_done)
     c3.metric("Avec dividendes", meta.get("with_dividends", 0))
     c4.metric("Échecs", n_fail)
+
     if meta.get("updated_at"):
         st.caption(f"Dernière mise à jour : {meta['updated_at']}")
 
@@ -1258,14 +1427,41 @@ def _render_dividend_universe_section(portfolio_tickers=None):
         step=5,
         help="Chaque clic traite les tickers pas encore présents dans le fichier univers.",
     )
-    if st.button("Mettre à jour l'univers dividendes (lot)", type="secondary"):
-        with st.spinner(f"Collecte en cours ({batch_size} tickers max)..."):
-            universe, processed = process_dividend_universe_batch(
-                all_tickers,
-                universe=universe,
-                limit=int(batch_size),
-                sleep_seconds=0.2,
+
+    if n_total > 0:
+        pct_global = min(1.0, n_done / n_total)
+        st.progress(
+            pct_global,
+            text=(
+                f"Avancement global : {n_done:,} / {n_total:,} tickers "
+                f"({pct_global * 100:.1f} %)"
+            ),
+        )
+        restant = max(0, n_total - n_done)
+        if restant:
+            lots_restants = (restant + int(batch_size) - 1) // int(batch_size)
+            st.caption(
+                f"Restant : {restant:,} ticker(s) "
+                f"(≈ {lots_restants:,} clic(s) de {int(batch_size)} au lot actuel)."
             )
+
+    if st.button("Mettre à jour l'univers dividendes (lot)", type="secondary"):
+        progress_lot = st.progress(0.0, text="Préparation du lot…")
+
+        def _on_batch_progress(pct, ticker, current, batch_len):
+            progress_lot.progress(
+                min(1.0, pct),
+                text=f"Lot en cours : {current}/{batch_len} — {ticker}",
+            )
+
+        universe, processed = process_dividend_universe_batch(
+            all_tickers,
+            universe=universe,
+            limit=int(batch_size),
+            sleep_seconds=0.2,
+            progress_callback=_on_batch_progress,
+        )
+        progress_lot.progress(1.0, text="Lot terminé.")
         st.success(f"{processed} ticker(s) traité(s) — fichier mis à jour.")
         st.rerun()
 
@@ -1346,6 +1542,7 @@ def _render_dividend_universe_section(portfolio_tickers=None):
     )
 
 
+@st.fragment
 def render_dividendes_dashboard(prices, returns):
     st.subheader("Dividendes & Qualité")
     _render_dividend_legend()
@@ -1417,6 +1614,12 @@ def render_dividendes_dashboard(prices, returns):
     if reset_clicked:
         fetch_ticker_dividend_bundle.clear()
         clear_dividends_disk_cache(ticker_signature)
+        try:
+            from dashboard_cache import clear_dashboard_compute_cache
+
+            clear_dashboard_compute_cache()
+        except ImportError:
+            pass
         if cache_key in st.session_state:
             del st.session_state[cache_key]
         disk_loaded_key = f"{cache_key}_disk_loaded"

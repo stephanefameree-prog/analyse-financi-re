@@ -4,7 +4,7 @@ import os
 import pandas as pd
 import streamlit as st
 
-from asset_summary import build_asset_summary_table
+from asset_summary import cached_build_asset_summary_table
 from data_loader import add_company_names, get_ticker_names, ticker_label
 from display_units import (
     WATCHLIST_FORMAT,
@@ -152,8 +152,23 @@ WATCHLIST_DISPLAY_COLUMNS = [
 ]
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_build_watchlist_table(prices_sig, rsi_period, prices):
+    df = cached_build_asset_summary_table(prices_sig, rsi_period, prices)
+    if df.empty:
+        return df
+    for col in WATCHLIST_DISPLAY_COLUMNS:
+        if col not in df.columns and col != "Nom":
+            df[col] = None
+    return df
+
+
 def build_watchlist_table(prices, rsi_period=14):
-    df = build_asset_summary_table(prices, rsi_period=rsi_period)
+    df = cached_build_asset_summary_table(
+        "|".join(sorted(str(c) for c in prices.columns)),
+        rsi_period,
+        prices,
+    )
     if df.empty:
         return df
     for col in WATCHLIST_DISPLAY_COLUMNS:
@@ -295,6 +310,7 @@ def render_watchlist_sidebar(show_company_names, index_tickers=None):
     return tickers, active_name
 
 
+@st.fragment
 def render_watchlist_dashboard(prices, ticker_names, show_company_names, watchlist_name):
     st.header(f"👁 Watchlist : {watchlist_name}")
     st.caption(
@@ -309,9 +325,10 @@ def render_watchlist_dashboard(prices, ticker_names, show_company_names, watchli
     rsi_key = f"{cache_key}_rsi"
 
     if run or cache_key not in st.session_state:
+        prices_sig = "|".join(sorted(str(c) for c in prices.columns))
         with st.spinner("Analyse fondamentale et technique en cours..."):
-            st.session_state[cache_key] = build_watchlist_table(
-                prices, rsi_period=rsi_period
+            st.session_state[cache_key] = cached_build_watchlist_table(
+                prices_sig, rsi_period, prices
             )
             st.session_state[rsi_key] = rsi_period
     elif st.session_state.get(rsi_key) != rsi_period:

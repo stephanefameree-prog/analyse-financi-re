@@ -158,6 +158,8 @@ FUNDAMENTALS_LABELS = {
     "Objectif haut": "Objectif haut (/ action)",
     "Score Piotroski": "Score Piotroski (/ 9)",
     "Nb analystes": "Nb analystes (nb)",
+    "Collecte Yahoo": "Collecte fondamentaux",
+    "Notes interprétation": "Notes interprétation",
 }
 
 FUNDAMENTALS_EXTRA_FORMAT = {
@@ -176,7 +178,9 @@ FUNDAMENTALS_EXTRA_FORMAT = {
 FUNDAMENTALS_CAPTION = (
     "**%** = pourcentage · **×** = multiple · **mon.** = montant en devise du titre "
     "(colonne Devise si présente, sinon devise Yahoo) · **/ action** = par titre · "
-    "**nb** = nombre · **ann.** = annualisé."
+    "**nb** = nombre · **ann.** = annualisé · "
+    "**Collecte fondamentaux** = date du dernier téléchargement Yahoo (cache 24 h) · "
+    "**Cours / var. jour** = recalculés à l'affichage (Yahoo + historique OHLCV)."
 )
 
 # --- Watchlist / synthèse ---
@@ -366,6 +370,48 @@ SUGGESTIONS_LABELS = {
     "Δ Kurtosis portef.": "Δ Kurtosis portef.",
     "Δ Skewness portef.": "Δ Skewness portef.",
     "Δ Corr. interne": "Δ Corr. interne (0–1)",
+    **{
+        col: FUNDAMENTALS_LABELS[col]
+        for col in (
+            "Score Piotroski",
+            "ROE",
+            "ROIC",
+            "Marge nette (moy. 5 ans)",
+            "PER",
+            "Ratio PEG",
+            "Dette / Capitaux",
+            "Dette / FCF",
+            "Upside vs objectif",
+            "Recommandation",
+        )
+        if col in FUNDAMENTALS_LABELS
+    },
+    **{
+        col: TECHNICAL_LABELS[col]
+        for col in (
+            "RSI",
+            "Signal RSI",
+            "Bollinger %B",
+            "Stoch %K",
+            "Signal MM",
+        )
+        if col in TECHNICAL_LABELS
+    },
+    **{
+        col: DIVIDEND_PORTFOLIO_LABELS[col]
+        for col in (
+            "Rendement",
+            "CAGR 5 ans",
+            "Payout",
+            "FCF Payout",
+            "Années de croissance",
+            "Score",
+        )
+        if col in DIVIDEND_PORTFOLIO_LABELS
+    },
+    "Statut": "Statut",
+    "Ratio couverture": "Ratio couverture (×)",
+    "Ratio couverture FCF": "Ratio couverture FCF (×)",
 }
 
 SUGGESTIONS_FORMAT = {
@@ -387,6 +433,53 @@ SUGGESTIONS_FORMAT = {
     "Δ Skewness portef.": "{:.2f}",
     "Δ Corr. interne (0–1)": "{:.2f}",
     "Δ Corr. interne": "{:.2f}",
+    "Score Piotroski (/ 9)": "{:.0f}",
+    "Score Piotroski": "{:.0f}",
+    "ROE (%)": "{:.2%}",
+    "ROE": "{:.2%}",
+    "ROIC (%)": "{:.2%}",
+    "ROIC": "{:.2%}",
+    "Marge nette moy. 5 ans (%)": "{:.2%}",
+    "Marge nette (moy. 5 ans)": "{:.2%}",
+    "PER (×)": "{:.2f}×",
+    "PER": "{:.2f}×",
+    "PEG (×)": "{:.2f}×",
+    "Ratio PEG": "{:.2f}×",
+    "Dette / Capitaux (×)": "{:.2f}×",
+    "Dette / Capitaux": "{:.2f}×",
+    "Dette / FCF (×)": "{:.2f}×",
+    "Dette / FCF": "{:.2f}×",
+    "Upside vs objectif (%)": "{:.2%}",
+    "Upside vs objectif": "{:.2%}",
+    "RSI (0–100)": "{:.1f}",
+    "RSI": "{:.1f}",
+    "Bollinger %B (0–1)": "{:.2f}",
+    "Bollinger %B": "{:.2f}",
+    "Stochastique %K (0–100)": "{:.1f}",
+    "Stoch %K": "{:.1f}",
+    **{
+        k: v
+        for k, v in DIVIDEND_PORTFOLIO_FORMAT_BASE.items()
+        if k
+        in (
+            "Rendement (%)",
+            "Rendement",
+            "CAGR 5 ans (%)",
+            "CAGR 5 ans",
+            "Payout (%)",
+            "Payout",
+            "FCF Payout (%)",
+            "FCF Payout",
+            "Années de croissance (ans)",
+            "Années de croissance",
+            "Score qualité (pts / ~100)",
+            "Score",
+        )
+    },
+    "Ratio couverture (×)": "{:.2f}×",
+    "Ratio couverture": "{:.2f}×",
+    "Ratio couverture FCF (×)": "{:.2f}×",
+    "Ratio couverture FCF": "{:.2f}×",
 }
 
 ASSET_SUMMARY_LABELS = WATCHLIST_LABELS

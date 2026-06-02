@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from scipy.optimize import minimize
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
@@ -524,6 +525,89 @@ def build_mean_median_mode_pedagogy_chart():
 
 TRADING_DAYS_PER_YEAR = 252
 
+FFT_TREND_LOG_LINEAR = "log_linear"
+FFT_TREND_LINEAR_PRICE = "linear_price"
+FFT_TREND_HP = "hp"
+
+FFT_TREND_OPTIONS = {
+    FFT_TREND_LOG_LINEAR: "Log-linéaire (croissance % constante)",
+    FFT_TREND_LINEAR_PRICE: "Linéaire sur le prix (€)",
+    FFT_TREND_HP: "Filtre Hodrick-Prescott",
+}
+
+HP_LAMBDA_DAILY = 6.25e6
+
+
+FFT_TREND_LEGEND = {
+    FFT_TREND_LOG_LINEAR: "log-linéaire",
+    FFT_TREND_LINEAR_PRICE: "linéaire €",
+    FFT_TREND_HP: "Hodrick-Prescott",
+}
+
+
+def fft_trend_mode_label(trend_mode):
+    return FFT_TREND_OPTIONS.get(trend_mode, str(trend_mode))
+
+
+def fft_trend_legend_label(trend_mode):
+    return FFT_TREND_LEGEND.get(trend_mode, str(trend_mode))
+
+
+def _hodrick_prescott(y, lamb=HP_LAMBDA_DAILY):
+    """Filtre HP : sépare tendance lisse et composante cyclique (additif sur le prix)."""
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    if n < 4:
+        return y.copy(), np.zeros(n)
+    d = np.zeros((n - 2, n))
+    for i in range(n - 2):
+        d[i, i] = 1.0
+        d[i, i + 1] = -2.0
+        d[i, i + 2] = 1.0
+    trend = np.linalg.solve(np.eye(n) + lamb * d.T @ d, y)
+    return trend, y - trend
+
+
+def _positive_trend(trend_p, ref_p):
+    floor = float(np.max(ref_p)) * 1e-8 + 1e-12
+    return np.maximum(np.asarray(trend_p, dtype=float), floor)
+
+
+def _fit_price_trend(prices, t, trend_mode):
+    p = np.asarray(prices, dtype=float)
+    if trend_mode == FFT_TREND_LOG_LINEAR:
+        log_p = np.log(p)
+        log_tr = np.polyval(np.polyfit(t, log_p, 1), t)
+        return _positive_trend(np.exp(log_tr), p)
+    if trend_mode == FFT_TREND_LINEAR_PRICE:
+        return _positive_trend(np.polyval(np.polyfit(t, p, 1), t), p)
+    if trend_mode == FFT_TREND_HP:
+        trend_p, _ = _hodrick_prescott(p)
+        return _positive_trend(trend_p, p)
+    raise ValueError(f"Mode de tendance inconnu: {trend_mode}")
+
+
+def _extend_price_trend(trend_p, n_total, trend_mode):
+    n = len(trend_p)
+    t_hist = np.arange(n)
+    t_ext = np.arange(n_total)
+    trend_p = np.asarray(trend_p, dtype=float)
+    if trend_mode == FFT_TREND_LOG_LINEAR:
+        log_tr = np.log(trend_p)
+        log_ext = np.polyval(np.polyfit(t_hist, log_tr, 1), t_ext)
+        return np.exp(log_ext)
+    return np.polyval(np.polyfit(t_hist, trend_p, 1), t_ext)
+
+
+def _trend_fit_metrics(prices, trend_p):
+    p = np.asarray(prices, dtype=float)
+    trend_p = np.asarray(trend_p, dtype=float)
+    ss_res = float(np.sum((p - trend_p) ** 2))
+    ss_tot = float(np.sum((p - p.mean()) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    rmse = float(np.sqrt(np.mean((p - trend_p) ** 2)))
+    return r2, rmse
+
 
 def format_fft_period_label(days):
     """Libellé lisible pour une période en jours de bourse."""
@@ -542,32 +626,72 @@ def format_fft_period_label(days):
     return f"{days:.0f} j (~{years:.1f} an(s))"
 
 
+def _prepare_fft_detrended_series(price_series, trend_mode=FFT_TREND_LOG_LINEAR):
+    """
+    Retire une tendance de fond (log-linéaire, linéaire € ou HP) avant FFT.
+    Le signal cyclique analysé = log(prix) − log(tendance).
+    """
+    if trend_mode not in FFT_TREND_OPTIONS:
+        trend_mode = FFT_TREND_LOG_LINEAR
+
+    s = pd.Series(price_series).dropna().astype(float)
+    if len(s) < 40:
+        return None
+
+    p = s.values
+    t = np.arange(len(p))
+    trend_p = _fit_price_trend(p, t, trend_mode)
+    log_p = np.log(p)
+    log_trend = np.log(trend_p)
+    detrended = log_p - log_trend
+    trend_r2, trend_rmse = _trend_fit_metrics(p, trend_p)
+
+    return {
+        "series": s,
+        "dates": s.index,
+        "prices": s,
+        "trend_mode": trend_mode,
+        "trend_prices": pd.Series(trend_p, index=s.index),
+        "log_trend": pd.Series(log_trend, index=s.index),
+        "detrended_log": pd.Series(detrended, index=s.index),
+        "detrended": detrended,
+        "trend_r2": trend_r2,
+        "trend_rmse": trend_rmse,
+        "n_obs": len(s),
+    }
+
+
+def _prepare_log_detrended_series(price_series):
+    """Alias rétrocompatible — tendance log-linéaire."""
+    return _prepare_fft_detrended_series(price_series, trend_mode=FFT_TREND_LOG_LINEAR)
+
+
 def compute_fft_periodicity(
     price_series,
     min_period_days=5,
     max_period_days=None,
     top_n=8,
+    trend_mode=FFT_TREND_LOG_LINEAR,
 ):
     """
     FFT sur série de prix (log + dé-trend) pour détecter des cycles périodiques.
 
     Retourne None si historique trop court.
     """
-    s = pd.Series(price_series).dropna().astype(float)
-    if len(s) < 40:
+    prep = _prepare_fft_detrended_series(price_series, trend_mode=trend_mode)
+    if prep is None:
         return None
 
-    if max_period_days is None:
-        max_period_days = min(len(s) // 2, TRADING_DAYS_PER_YEAR)
+    s = prep["series"]
+    detrended = prep["detrended"]
+    trend = prep["log_trend"].values
+    n = prep["n_obs"]
 
-    log_p = np.log(s.values)
-    t = np.arange(len(log_p))
-    trend = np.polyval(np.polyfit(t, log_p, 1), t)
-    detrended = log_p - trend
+    if max_period_days is None:
+        max_period_days = min(n // 2, TRADING_DAYS_PER_YEAR)
 
     window = np.hanning(len(detrended))
     windowed = detrended * window
-    n = len(windowed)
 
     fft_vals = np.fft.rfft(windowed)
     power = np.abs(fft_vals) ** 2
@@ -619,6 +743,10 @@ def compute_fft_periodicity(
     return {
         "dates": s.index,
         "prices": s,
+        "trend_mode": prep["trend_mode"],
+        "trend_prices": prep["trend_prices"],
+        "trend_r2": prep["trend_r2"],
+        "trend_rmse": prep["trend_rmse"],
         "log_trend": pd.Series(trend, index=s.index),
         "detrended_log": pd.Series(detrended, index=s.index),
         "periods_days": periods,
@@ -643,7 +771,113 @@ def reconstruct_fft_cycles(detrended_values, peak_freq_indices, n_obs):
     return cyclic
 
 
-def compute_fft_summary_for_prices(prices, min_period_days=5, max_period_days=None, top_n=3):
+FFT_FORECAST_RATIO = 0.30
+
+
+def _synthesize_rfft_peaks(fft_vals, peak_indices, n_hist, n_total):
+    """Prolonge la somme des harmoniques FFT au-delà de l'historique."""
+    t = np.arange(n_total, dtype=float)
+    out = np.zeros(n_total, dtype=float)
+    for fi in peak_indices:
+        fi = int(fi)
+        if fi <= 0 or fi >= len(fft_vals):
+            continue
+        coef = fft_vals[fi]
+        if n_hist % 2 == 0 and fi == len(fft_vals) - 1:
+            out += (1.0 / n_hist) * np.real(coef) * np.cos(np.pi * t)
+        else:
+            out += (2.0 / n_hist) * np.real(coef * np.exp(2j * np.pi * fi * t / n_hist))
+    return out
+
+
+def build_fft_extended_series(result, peak_indices, extend_ratio=FFT_FORECAST_RATIO):
+    """Extrapole tendance log + harmoniques sur extend_ratio × la durée historique."""
+    if not peak_indices or extend_ratio <= 0:
+        return None
+
+    n = int(result["n_obs"])
+    n_extra = max(1, int(round(n * extend_ratio)))
+    n_total = n + n_extra
+
+    detrended = np.asarray(result["detrended_log"].values, dtype=float)
+    windowed = detrended * np.hanning(n)
+    fft_vals = np.fft.rfft(windowed)
+
+    log_trend_hist = np.asarray(result["log_trend"].values, dtype=float)
+    trend_mode = result.get("trend_mode", FFT_TREND_LOG_LINEAR)
+    trend_p_hist = np.asarray(result["trend_prices"].values, dtype=float)
+    trend_p_ext = _extend_price_trend(trend_p_hist, n_total, trend_mode)
+    trend_p_ext = _positive_trend(trend_p_ext, result["prices"].values)
+    log_trend_ext = np.log(trend_p_ext)
+    cyclic_ext = _synthesize_rfft_peaks(fft_vals, peak_indices, n, n_total)
+    log_model_ext = log_trend_ext + cyclic_ext
+    price_model_ext = np.exp(log_model_ext)
+
+    prices = result["prices"]
+    mean_p = float(prices.mean())
+    std_p = float(prices.std()) + 1e-8
+    trend_norm_ext = (trend_p_ext - mean_p) / std_p
+    cyclic_norm_ext = (cyclic_ext - cyclic_ext[:n].mean()) / (float(cyclic_ext[:n].std()) + 1e-8)
+
+    hist_dates = pd.DatetimeIndex(result["dates"])
+    future_dates = pd.bdate_range(start=hist_dates[-1] + pd.offsets.BDay(1), periods=n_extra)
+    all_dates = hist_dates.union(future_dates)
+
+    return {
+        "dates": all_dates,
+        "n_hist": n,
+        "n_extra": n_extra,
+        "extend_ratio": extend_ratio,
+        "trend_norm": trend_norm_ext,
+        "trend_prices_ext": trend_p_ext,
+        "cyclic_norm": cyclic_norm_ext,
+        "price_model": price_model_ext,
+        "prices_hist": np.asarray(prices.values, dtype=float),
+        "hist_end": hist_dates[-1],
+    }
+
+
+def _add_fft_split_trace(
+    fig,
+    dates,
+    values,
+    n_hist,
+    name,
+    line_color,
+    line_width,
+    dash_forecast="dash",
+    secondary_y=False,
+    forecast_suffix=None,
+):
+    """Trace historique (plein) + extrapolation (pointillé) avec point de jonction."""
+    forecast_suffix = forecast_suffix or f" (+{int(round(FFT_FORECAST_RATIO * 100))}%)"
+    trace_kwargs = {"secondary_y": secondary_y} if secondary_y else {}
+    fig.add_trace(
+        go.Scatter(
+            x=dates[:n_hist],
+            y=values[:n_hist],
+            mode="lines",
+            name=name,
+            line=dict(color=line_color, width=line_width),
+        ),
+        **trace_kwargs,
+    )
+    if n_hist < len(dates):
+        fig.add_trace(
+            go.Scatter(
+                x=dates[n_hist - 1 :],
+                y=values[n_hist - 1 :],
+                mode="lines",
+                name=f"{name}{forecast_suffix}",
+                line=dict(color=line_color, width=line_width, dash=dash_forecast),
+            ),
+            **trace_kwargs,
+        )
+
+
+def compute_fft_summary_for_prices(
+    prices, min_period_days=5, max_period_days=None, top_n=3, trend_mode=FFT_TREND_LOG_LINEAR
+):
     """Tableau récapitulatif : périodes dominantes par ticker."""
     rows = []
     for ticker in prices.columns:
@@ -652,6 +886,7 @@ def compute_fft_summary_for_prices(prices, min_period_days=5, max_period_days=No
             min_period_days=min_period_days,
             max_period_days=max_period_days,
             top_n=top_n,
+            trend_mode=trend_mode,
         )
         if result is None:
             continue
@@ -715,75 +950,249 @@ def build_fft_spectrum_chart(result, title="Spectre de puissance (FFT)"):
     return fig
 
 
-def _fft_fond_trend_normalized(prices, log_trend):
+def _fft_windowed_signal(result):
+    """Signal log dé-trendé × fenêtre Hanning (identique à l'entrée FFT)."""
+    detrended = np.asarray(result["detrended_log"].values, dtype=float)
+    return detrended * np.hanning(len(detrended))
+
+
+def compute_normalized_acf(signal, max_lag=None):
+    """Autocorrélation normalisée (lag 0 = 1) du signal centré."""
+    x = np.asarray(signal, dtype=float)
+    x = x - np.mean(x)
+    n = len(x)
+    if n < 2:
+        return np.array([0.0]), np.array([1.0])
+    if max_lag is None:
+        max_lag = min(n // 2, 252)
+    max_lag = int(min(max(max_lag, 1), n - 1))
+    corr_full = np.correlate(x, x, mode="full")
+    mid = n - 1
+    acf = corr_full[mid : mid + max_lag + 1]
+    acf = acf / (acf[0] + 1e-12)
+    return np.arange(max_lag + 1, dtype=float), acf
+
+
+def build_fft_spectral_acf_chart(
+    result,
+    title="Densité spectrale & autocorrélation",
+    max_acf_lag=None,
+):
     """
-    Droite de tendance de fond retirée avant FFT (régression log-linéaire),
-    reprojetée dans l'espace normalisé du prix affiché (centré / réduit).
+    Graphique dual : densité spectrale (période) et fonction d'autocorrélation (décalage).
+    Les deux vues proviennent du même signal dé-trendé (théorème de Wiener-Khinchin).
     """
-    prices = pd.Series(prices).astype(float)
-    log_trend = np.asarray(log_trend, dtype=float)
-    mean = float(prices.mean())
-    std = float(prices.std()) + 1e-8
-    trend_prices = np.exp(log_trend)
-    t = np.arange(len(trend_prices))
-    trend_norm = (trend_prices - mean) / std
-    return np.polyval(np.polyfit(t, trend_norm, 1), t)
+    periods = result["periods_days"]
+    power = result["power"]
+    density = power / (float(power.sum()) or 1.0)
+    peaks = result["peaks"]
+    n = int(result["n_obs"])
 
+    windowed = _fft_windowed_signal(result)
+    if max_acf_lag is None:
+        max_acf_lag = int(min(n // 2, result.get("max_period_days") or 252, 504))
+    lags, acf = compute_normalized_acf(windowed, max_lag=max_acf_lag)
+    conf = 1.96 / np.sqrt(n)
 
-def build_fft_cyclic_chart(result, n_components=3, title="Composante cyclique estimée"):
-    """Superpose prix (normalisé), cycle FFT et tendance de fond (log-linéaire)."""
-    detrended = result["detrended_log"].values
-    windowed = detrended * np.hanning(len(detrended))
-    peaks = result["peaks"].head(n_components)
-    indices = peaks["_freq_idx"].tolist()
-    cyclic = reconstruct_fft_cycles(windowed, indices, result["n_obs"])
-    dates = result["dates"]
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=False,
+        vertical_spacing=0.11,
+        subplot_titles=(
+            "Densité spectrale — |FFT|² normalisée vs période",
+            "Autocorrélation — signal log dé-trendé (fenêtre Hanning)",
+        ),
+        row_heights=[0.52, 0.48],
+    )
 
-    prices = result["prices"]
-    price_norm = (prices - prices.mean()) / (prices.std() + 1e-8)
-    cyclic_norm = (cyclic - cyclic.mean()) / (cyclic.std() + 1e-8)
-
-    fig = go.Figure()
     fig.add_trace(
         go.Scatter(
-            x=dates,
-            y=price_norm,
+            x=periods,
+            y=density,
             mode="lines",
-            name="Prix (centré/réduit)",
-            line=dict(color="lightgray", width=1),
-        )
+            name="Densité spectrale",
+            line=dict(color="#2563eb", width=1.5),
+            hovertemplate="Période: %{x:.1f} j<br>Densité: %{y:.2%}<extra></extra>",
+        ),
+        row=1,
+        col=1,
     )
-    if "log_trend" in result:
-        log_trend = result["log_trend"].values
-    else:
-        log_p = np.log(prices.astype(float).values)
-        t_idx = np.arange(len(log_p))
-        log_trend = np.polyval(np.polyfit(t_idx, log_p, 1), t_idx)
-    trend_fond = _fft_fond_trend_normalized(prices, log_trend)
+    if not peaks.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=peaks["Période (jours)"],
+                y=peaks["Puissance relative"],
+                mode="markers+text",
+                name="Pics dominants",
+                marker=dict(color="#dc2626", size=9),
+                text=[f"#{int(r)}" for r in peaks["Rang"]],
+                textposition="top center",
+                hovertemplate="Période: %{x:.1f} j<br>Part: %{y:.1%}<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
+
     fig.add_trace(
         go.Scatter(
-            x=dates,
-            y=trend_fond,
+            x=lags,
+            y=acf,
             mode="lines",
-            name="Tendance de fond (log)",
-            line=dict(color="royalblue", width=2, dash="dash"),
-        )
+            name="Autocorrélation",
+            line=dict(color="#7c3aed", width=1.5),
+            hovertemplate="Lag: %{x:.0f} j<br>ACF: %{y:.3f}<extra></extra>",
+        ),
+        row=2,
+        col=1,
     )
-    fig.add_trace(
-        go.Scatter(
-            x=dates,
-            y=cyclic_norm,
-            mode="lines",
-            name=f"Cycle FFT (top {len(indices)})",
-            line=dict(color="darkorange", width=2),
-        )
+    fig.add_hline(
+        y=conf,
+        line_dash="dot",
+        line_color="#94a3b8",
+        annotation_text="95 % (bruit blanc)",
+        annotation_position="right",
+        row=2,
+        col=1,
     )
+    fig.add_hline(y=-conf, line_dash="dot", line_color="#94a3b8", row=2, col=1)
+
+    for _, peak in peaks.head(3).iterrows():
+        period = float(peak["Période (jours)"])
+        if 1 <= period <= max_acf_lag:
+            fig.add_vline(
+                x=period,
+                line_dash="dash",
+                line_color="#f97316",
+                opacity=0.55,
+                row=2,
+                col=1,
+            )
+
     fig.update_layout(
         title=title,
+        height=580,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+    )
+    fig.update_xaxes(title_text="Période (jours)", type="log", row=1, col=1)
+    fig.update_yaxes(title_text="Densité relative", tickformat=".1%", row=1, col=1)
+    fig.update_xaxes(title_text="Décalage / lag (jours)", row=2, col=1)
+    fig.update_yaxes(title_text="Autocorrélation", range=[-1.05, 1.05], row=2, col=1)
+    return fig
+
+
+def _fft_fond_trend_normalized(prices, log_trend=None, trend_prices=None):
+    """
+    Tendance de fond reprojetée dans l'espace normalisé du prix (centré / réduit).
+    """
+    prices = pd.Series(prices).astype(float)
+    if trend_prices is not None:
+        trend_prices = np.asarray(trend_prices, dtype=float)
+    else:
+        log_trend = np.asarray(log_trend, dtype=float)
+        trend_prices = np.exp(log_trend)
+    mean = float(prices.mean())
+    std = float(prices.std()) + 1e-8
+    trend_norm = (trend_prices - mean) / std
+    return trend_norm
+
+
+def build_fft_cyclic_chart(
+    result,
+    n_components=3,
+    title="Composante cyclique estimée",
+    extend_ratio=FFT_FORECAST_RATIO,
+):
+    """Prix, tendance de fond (€) et extrapolation du modèle FFT (+30 % par défaut)."""
+    peaks = result["peaks"].head(n_components)
+    indices = peaks["_freq_idx"].tolist()
+    n_hist = result["n_obs"]
+    trend_mode = result.get("trend_mode", FFT_TREND_LOG_LINEAR)
+    trend_name = f"Tendance de fond ({fft_trend_legend_label(trend_mode)})"
+
+    extended = build_fft_extended_series(result, indices, extend_ratio=extend_ratio)
+    if extended is not None:
+        dates = extended["dates"]
+        n_hist = extended["n_hist"]
+        trend_line = extended["trend_prices_ext"]
+        price_model = extended["price_model"]
+        prices_hist = extended["prices_hist"]
+        hist_end = extended["hist_end"]
+    else:
+        dates = result["dates"]
+        prices_hist = np.asarray(result["prices"].values, dtype=float)
+        trend_line = np.asarray(result["trend_prices"].values, dtype=float)
+        price_model = None
+        hist_end = pd.Timestamp(dates[-1])
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scatter(
+            x=dates[:n_hist],
+            y=prices_hist,
+            mode="lines",
+            name="Prix (historique)",
+            line=dict(color="#1e40af", width=2.5),
+        )
+    )
+
+    if price_model is not None:
+        _add_fft_split_trace(
+            fig,
+            dates,
+            price_model,
+            n_hist,
+            "Modèle FFT (tendance + cycles)",
+            "#0ea5e9",
+            2.2,
+            dash_forecast="dash",
+            secondary_y=False,
+        )
+
+    _add_fft_split_trace(
+        fig,
+        dates,
+        trend_line,
+        n_hist,
+        trend_name,
+        "#64748b",
+        2.5,
+        dash_forecast="dash",
+        secondary_y=False,
+    )
+
+    if extended is not None:
+        pct = int(round(extended["extend_ratio"] * 100))
+        fig.add_shape(
+            type="line",
+            x0=hist_end,
+            x1=hist_end,
+            y0=0,
+            y1=1,
+            yref="paper",
+            line=dict(color="#94a3b8", dash="dot", width=1),
+        )
+        fig.add_annotation(
+            x=hist_end,
+            y=1.02,
+            yref="paper",
+            text="Fin historique",
+            showarrow=False,
+            font=dict(size=10, color="#64748b"),
+        )
+        title_suffix = f" · extrapolation +{pct} %"
+    else:
+        title_suffix = ""
+
+    fig.update_layout(
+        title=f"{title}{title_suffix}",
         xaxis_title="Date",
-        yaxis_title="Amplitude normalisée",
-        height=380,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        height=480,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        hovermode="x unified",
+        yaxis_title="Prix / modèle / tendance",
     )
     return fig
 
@@ -817,6 +1226,232 @@ def compute_advanced_risk_metrics(returns):
         }
     )
     return df
+
+
+def build_risk_returns_boxplot(returns, column_labels=None):
+    """Trait horizontal min–max des rendements journaliers avec Q1, médiane et Q3."""
+    column_labels = column_labels or {}
+    stats_rows = []
+    for col in returns.columns:
+        series = returns[col].dropna()
+        if series.empty:
+            continue
+        name = str(column_labels.get(col, col))
+        stats_rows.append(
+            (
+                name,
+                float(series.min()),
+                float(series.quantile(0.25)),
+                float(series.median()),
+                float(series.quantile(0.75)),
+                float(series.max()),
+            )
+        )
+
+    fig = go.Figure()
+    if not stats_rows:
+        return fig
+
+    for name, vmin, q1, med, q3, vmax in stats_rows:
+        fig.add_trace(
+            go.Scatter(
+                x=[vmin, vmax],
+                y=[name, name],
+                mode="lines",
+                line=dict(color="#94a3b8", width=2),
+                showlegend=False,
+                hovertemplate=(
+                    f"{name}<br>Min: {vmin:.2%}<br>Max: {vmax:.2%}"
+                    "<extra></extra>"
+                ),
+            )
+        )
+
+    q1_x, q1_y, med_x, med_y, q3_x, q3_y = [], [], [], [], [], []
+    for name, _vmin, q1, med, q3, _vmax in stats_rows:
+        q1_x.append(q1)
+        q1_y.append(name)
+        med_x.append(med)
+        med_y.append(name)
+        q3_x.append(q3)
+        q3_y.append(name)
+
+    fig.add_trace(
+        go.Scatter(
+            x=q1_x,
+            y=q1_y,
+            mode="markers",
+            name="Q1",
+            marker=dict(symbol="line-ns-open", size=14, color="#64748b", line=dict(width=2)),
+            hovertemplate="Q1: %{x:.2%}<extra>%{y}</extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=med_x,
+            y=med_y,
+            mode="markers",
+            name="Médiane",
+            marker=dict(symbol="diamond", size=11, color="#1e40af", line=dict(width=1, color="white")),
+            hovertemplate="Médiane: %{x:.2%}<extra>%{y}</extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=q3_x,
+            y=q3_y,
+            mode="markers",
+            name="Q3",
+            marker=dict(symbol="line-ns-open", size=14, color="#64748b", line=dict(width=2)),
+            hovertemplate="Q3: %{x:.2%}<extra>%{y}</extra>",
+        )
+    )
+
+    n_assets = len(stats_rows)
+    fig.update_layout(
+        title="Rendements journaliers — min, quartiles et médiane par actif",
+        xaxis_title="Rendement journalier",
+        yaxis_title="Actif",
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        height=max(420, 36 * n_assets + 140),
+    )
+    fig.update_xaxes(tickformat=".2%")
+    fig.update_yaxes(autorange="reversed")
+    return fig
+
+
+def build_risk_metrics_boxplot(metrics_df, columns):
+    """Répartition d'une métrique entre actifs : min–max, quartiles et points identifiés au survol."""
+    columns = [c for c in columns if c in metrics_df.columns]
+    if not columns:
+        return go.Figure()
+
+    percent_cols = {
+        "Rendement Annuel (moyenne)",
+        "Médiane annuelle",
+        "Mode annuelle",
+        "Volatilité (Sigma)",
+        "VaR 95% (Jour)",
+        "CVaR 95% (Jour)",
+    }
+    ratio_cols = {"Ratio de Sharpe", "Ratio de Sortino"}
+
+    def _fmt(col, val):
+        if col in percent_cols:
+            return f"{val:.2%}"
+        if col in ratio_cols:
+            return f"{val:.2f}"
+        return f"{val:.3f}"
+
+    fig = go.Figure()
+    q1_x, q1_y, med_x, med_y, q3_x, q3_y = [], [], [], [], [], []
+    pt_x, pt_y, pt_hover = [], [], []
+
+    for col in columns:
+        series = metrics_df[col].dropna()
+        if series.empty:
+            continue
+
+        vmin = float(series.min())
+        vmax = float(series.max())
+        q1 = float(series.quantile(0.25))
+        med = float(series.median())
+        q3 = float(series.quantile(0.75))
+
+        fig.add_trace(
+            go.Scatter(
+                x=[vmin, vmax],
+                y=[col, col],
+                mode="lines",
+                line=dict(color="#94a3b8", width=2),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+
+        q1_x.append(q1)
+        q1_y.append(col)
+        med_x.append(med)
+        med_y.append(col)
+        q3_x.append(q3)
+        q3_y.append(col)
+
+        for asset, val in series.items():
+            fv = float(val)
+            pt_x.append(fv)
+            pt_y.append(col)
+            pt_hover.append(f"<b>{asset}</b><br>{col}: {_fmt(col, fv)}")
+
+    if not pt_x:
+        return fig
+
+    all_pct = all(c in percent_cols for c in columns)
+    all_ratio = all(c in ratio_cols for c in columns)
+    if all_pct:
+        q_hover = lambda label: f"{label}: %{{x:.2%}}<extra>%{{y}}</extra>"
+    elif all_ratio:
+        q_hover = lambda label: f"{label}: %{{x:.2f}}<extra>%{{y}}</extra>"
+    else:
+        q_hover = lambda label: f"{label}: %{{x:.3f}}<extra>%{{y}}</extra>"
+
+    fig.add_trace(
+        go.Scatter(
+            x=q1_x,
+            y=q1_y,
+            mode="markers",
+            name="Q1",
+            marker=dict(symbol="line-ns-open", size=14, color="#64748b", line=dict(width=2)),
+            hovertemplate=q_hover("Q1"),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=med_x,
+            y=med_y,
+            mode="markers",
+            name="Médiane",
+            marker=dict(symbol="diamond", size=11, color="#1e40af", line=dict(width=1, color="white")),
+            hovertemplate=q_hover("Médiane"),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=q3_x,
+            y=q3_y,
+            mode="markers",
+            name="Q3",
+            marker=dict(symbol="line-ns-open", size=14, color="#64748b", line=dict(width=2)),
+            hovertemplate=q_hover("Q3"),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=pt_x,
+            y=pt_y,
+            mode="markers",
+            name="Actifs",
+            marker=dict(size=9, color="#6366f1", line=dict(width=1, color="white")),
+            customdata=pt_hover,
+            hovertemplate="%{customdata}<extra></extra>",
+        )
+    )
+
+    fig.update_layout(
+        title="Métriques de risque — étendue entre actifs (survol = nom du titre)",
+        xaxis_title="Valeur",
+        yaxis_title="Mesure",
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        height=max(360, 72 * len(columns) + 120),
+    )
+    fig.update_yaxes(autorange="reversed")
+    if all_pct:
+        fig.update_xaxes(tickformat=".2%")
+    elif all_ratio:
+        fig.update_xaxes(tickformat=".2f")
+
+    return fig
 
 
 def compute_max_drawdown(price_series):
@@ -2133,3 +2768,181 @@ def suggest_portfolio_additions(
 
     df = pd.DataFrame(rows)
     return df.sort_values("Score composite", ascending=False), baseline, baseline_internal
+
+
+DEFAULT_SUGGESTION_OBJECTIVE_WEIGHTS = {
+    "return": 1.0,
+    "vol": 1.0,
+    "kurt": 1.0,
+    "skew": 1.0,
+    "corr_internal": 1.0,
+    "corr_candidate": 1.0,
+}
+
+
+def filter_suggestions_by_statistics(
+    df,
+    min_candidate_return=None,
+    max_candidate_vol=None,
+    max_candidate_kurtosis=None,
+    min_candidate_skewness=None,
+    max_corr_portfolio=None,
+    min_delta_return=None,
+    min_delta_vol=None,
+    min_delta_kurtosis=None,
+    min_delta_skewness=None,
+    min_delta_corr_internal=None,
+):
+    """Filtre les suggestions selon des seuils risque / rendement / diversification."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+
+    if min_candidate_return is not None and "Rendement candidat" in out.columns:
+        out = out[out["Rendement candidat"].fillna(-1) >= min_candidate_return]
+    if max_candidate_vol is not None and "Volatilité candidat" in out.columns:
+        out = out[
+            out["Volatilité candidat"].isna()
+            | (out["Volatilité candidat"] <= max_candidate_vol)
+        ]
+    if max_candidate_kurtosis is not None and "Kurtosis candidat" in out.columns:
+        out = out[
+            out["Kurtosis candidat"].isna()
+            | (out["Kurtosis candidat"] <= max_candidate_kurtosis)
+        ]
+    if min_candidate_skewness is not None and "Skewness candidat" in out.columns:
+        out = out[out["Skewness candidat"].fillna(-1) >= min_candidate_skewness]
+    if max_corr_portfolio is not None and "Corr. moy. portefeuille" in out.columns:
+        out = out[
+            out["Corr. moy. portefeuille"].isna()
+            | (out["Corr. moy. portefeuille"] <= max_corr_portfolio)
+        ]
+    if min_delta_return is not None and "Δ Rendement portef." in out.columns:
+        out = out[out["Δ Rendement portef."].fillna(-1) >= min_delta_return]
+    if min_delta_vol is not None and "Δ Volatilité portef." in out.columns:
+        out = out[out["Δ Volatilité portef."].fillna(-1) >= min_delta_vol]
+    if min_delta_kurtosis is not None and "Δ Kurtosis portef." in out.columns:
+        out = out[out["Δ Kurtosis portef."].fillna(-1) >= min_delta_kurtosis]
+    if min_delta_skewness is not None and "Δ Skewness portef." in out.columns:
+        out = out[out["Δ Skewness portef."].fillna(-1) >= min_delta_skewness]
+    if min_delta_corr_internal is not None and "Δ Corr. interne" in out.columns:
+        out = out[out["Δ Corr. interne"].fillna(-1) >= min_delta_corr_internal]
+
+    return out
+
+
+_STYLE_FAVORABLE = "background-color: #d4edda; color: #155724"
+_STYLE_UNFAVORABLE = "background-color: #f8d7da; color: #721c24"
+
+SUGGESTION_TECHNICAL_COLUMNS = (
+    "RSI",
+    "Signal RSI",
+    "Bollinger %B",
+    "Stoch %K",
+    "Signal MM",
+)
+
+
+def merge_technical_columns(df, tech_df, columns=None):
+    """Joint les indicateurs techniques au tableau de suggestions (clé Ticker)."""
+    if df is None or df.empty or tech_df is None or tech_df.empty:
+        return df
+    columns = columns or SUGGESTION_TECHNICAL_COLUMNS
+    keep = ["Ticker"] + [c for c in columns if c in tech_df.columns]
+    tech_df = tech_df[keep].drop_duplicates(subset=["Ticker"], keep="last")
+    return df.merge(tech_df, on="Ticker", how="left")
+
+
+def enrich_suggestions_with_technical(df, prices, rsi_period=14, columns=None):
+    """Calcule RSI, Bollinger %B, etc. à partir des cours candidats."""
+    if df is None or df.empty or prices is None or prices.empty:
+        return df
+    tickers = [t for t in df["Ticker"] if t in prices.columns]
+    if not tickers:
+        return df
+    tech_df = compute_technical_indicators(prices[tickers], rsi_period=rsi_period)
+    return merge_technical_columns(df, tech_df, columns=columns)
+
+
+def filter_suggestions_by_technical(
+    df,
+    max_rsi=None,
+    min_rsi=None,
+    max_bollinger_b=None,
+    min_bollinger_b=None,
+):
+    """Filtre les suggestions selon des seuils techniques (RSI, Bollinger %B)."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if max_rsi is not None and "RSI" in out.columns:
+        out = out[out["RSI"].isna() | (out["RSI"] <= max_rsi)]
+    if min_rsi is not None and "RSI" in out.columns:
+        out = out[out["RSI"].isna() | (out["RSI"] >= min_rsi)]
+    if max_bollinger_b is not None and "Bollinger %B" in out.columns:
+        out = out[
+            out["Bollinger %B"].isna()
+            | (out["Bollinger %B"] <= max_bollinger_b)
+        ]
+    if min_bollinger_b is not None and "Bollinger %B" in out.columns:
+        out = out[
+            out["Bollinger %B"].isna()
+            | (out["Bollinger %B"] >= min_bollinger_b)
+        ]
+    return out
+
+
+def _technical_metric_sentiment(column, val):
+    """Vert = zone basse (potentiel rebond) · rouge = zone haute (surachat)."""
+    v = _safe_float_technical(val)
+    if v is None:
+        return ""
+    col = str(column)
+    if col in ("RSI", "RSI (0–100)"):
+        if v <= 35:
+            return _STYLE_FAVORABLE
+        if v >= 65:
+            return _STYLE_UNFAVORABLE
+    elif col in ("Bollinger %B", "Bollinger %B (0–1)"):
+        if v <= 0.2:
+            return _STYLE_FAVORABLE
+        if v >= 0.8:
+            return _STYLE_UNFAVORABLE
+    elif col in ("Stoch %K", "Stochastique %K (0–100)"):
+        if v <= 25:
+            return _STYLE_FAVORABLE
+        if v >= 75:
+            return _STYLE_UNFAVORABLE
+    return ""
+
+
+def _safe_float_technical(value):
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (float, int, np.floating, np.integer)):
+            if np.isnan(value) or np.isinf(value):
+                return None
+            return float(value)
+    except Exception:
+        pass
+    return None
+
+
+def style_suggestions_technical(styler):
+    """Code couleur RSI / Bollinger / stochastique dans le tableau suggestions."""
+    tech_cols = {
+        "RSI",
+        "RSI (0–100)",
+        "Bollinger %B",
+        "Bollinger %B (0–1)",
+        "Stoch %K",
+        "Stochastique %K (0–100)",
+    }
+
+    def _color_column(series):
+        if series.name not in tech_cols:
+            return [""] * len(series)
+        return [_technical_metric_sentiment(series.name, v) for v in series]
+
+    return styler.apply(_color_column, axis=0)
