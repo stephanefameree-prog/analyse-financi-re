@@ -1,4 +1,5 @@
 import hashlib
+import os
 import pickle
 import random
 import time
@@ -373,12 +374,18 @@ def load_prices_in_batches(tickers, start, batch_size=DEFAULT_BATCH_SIZE, refres
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_ticker_names(tickers):
-    """Récupère le nom court Yahoo par lots (sans appels lents ticker par ticker)."""
+def get_ticker_metadata(tickers, need_names: bool = True, need_sectors: bool = True):
+    """Noms et/ou secteurs Yahoo en une passe (price + asset_profile par lot)."""
     tickers = tuple(sorted({str(t).strip() for t in tickers if str(t).strip()}))
-    names = {t: t for t in tickers}
+    names: dict[str, str] = {}
+    sectors: dict[str, str] = {}
     if not tickers:
-        return names
+        return names, sectors
+    if not need_names and not need_sectors:
+        return names, sectors
+
+    if need_names:
+        names = {t: t for t in tickers}
 
     try:
         from yahooquery import Ticker
@@ -386,18 +393,220 @@ def get_ticker_names(tickers):
         chunk_size = 100
         for i in range(0, len(tickers), chunk_size):
             chunk = list(tickers[i : i + chunk_size])
-            payload = Ticker(chunk, timeout=25).price
-            if isinstance(payload, dict):
-                for tk in chunk:
-                    block = payload.get(tk)
-                    if isinstance(block, dict):
-                        label = block.get("shortName") or block.get("longName")
-                        if label:
-                            names[tk] = str(label)
+            yq = Ticker(chunk, timeout=25)
+            if need_names:
+                payload = yq.price
+                if isinstance(payload, dict):
+                    for tk in chunk:
+                        block = payload.get(tk)
+                        if isinstance(block, dict):
+                            label = block.get("shortName") or block.get("longName")
+                            if label:
+                                names[tk] = str(label)
+            if need_sectors:
+                payload = yq.asset_profile
+                if isinstance(payload, dict):
+                    for tk in chunk:
+                        block = payload.get(tk)
+                        if isinstance(block, dict):
+                            sector = block.get("sector")
+                            if sector:
+                                sectors[tk] = str(sector)
     except Exception:
         pass
 
-    return names
+    if need_names:
+        missing = [t for t in tickers if names.get(t) == t]
+        if missing:
+            _fill_ticker_names_from_fmp(names, missing)
+
+    return names, sectors
+
+
+def get_ticker_names(tickers):
+    """Récupère le nom court Yahoo par lots (sans appels lents ticker par ticker)."""
+    return get_ticker_metadata(tickers, need_names=True, need_sectors=False)[0]
+
+
+def get_ticker_sectors(tickers):
+    """Secteur Yahoo Finance par lots (asset_profile)."""
+    return get_ticker_metadata(tickers, need_names=False, need_sectors=True)[1]
+
+
+def get_fmp_api_key() -> str:
+    """Clé FMP via variable d'environnement FMP_API_KEY ou st.secrets."""
+    key = os.environ.get("FMP_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        return str(st.secrets.get("FMP_API_KEY", "")).strip()
+    except Exception:
+        return ""
+
+
+def _fill_ticker_names_from_fmp(names: dict[str, str], tickers: list[str]) -> None:
+    api_key = get_fmp_api_key()
+    if not api_key:
+        return
+
+    try:
+        import requests
+    except ImportError:
+        return
+
+    chunk_size = 20
+    for i in range(0, len(tickers), chunk_size):
+        chunk = tickers[i : i + chunk_size]
+        try:
+            response = requests.get(
+                f"{FMP_PROFILE_URL}/{','.join(chunk)}",
+                params={"apikey": api_key},
+                timeout=12,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except Exception:
+            continue
+
+        rows = payload if isinstance(payload, list) else [payload]
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol") or "").strip()
+            label = item.get("companyName") or item.get("name")
+            if symbol and label and symbol in names:
+                names[symbol] = str(label).strip()
+
+
+YAHOO_SEARCH_URL = "https://query2.finance.yahoo.com/v1/finance/search"
+YAHOO_SEARCH_TYPES = frozenset({"EQUITY", "ETF"})
+FMP_SEARCH_URL = "https://financialmodelingprep.com/api/v3/search"
+FMP_PROFILE_URL = "https://financialmodelingprep.com/api/v3/profile"
+
+
+def parse_yahoo_search_quotes(quotes, max_results=8):
+    """Extrait symboles action/ETF d'une réponse Yahoo search."""
+    results: list[dict[str, str]] = []
+    if not quotes:
+        return results
+    for item in quotes:
+        if not isinstance(item, dict):
+            continue
+        symbol = str(item.get("symbol") or "").strip()
+        if not symbol:
+            continue
+        quote_type = str(item.get("quoteType") or "").upper()
+        if quote_type and quote_type not in YAHOO_SEARCH_TYPES:
+            continue
+        name = item.get("shortname") or item.get("longname") or symbol
+        exchange = str(item.get("exchange") or "").strip()
+        results.append(
+            {
+                "symbol": symbol,
+                "name": str(name).strip(),
+                "exchange": exchange,
+                "type": quote_type or "EQUITY",
+            }
+        )
+        if len(results) >= max_results:
+            break
+    return results
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_yahoo_symbols(query: str, max_results: int = 8):
+    """Recherche Yahoo Finance par nom de société ou ticker partiel."""
+    query = str(query).strip()
+    if len(query) < 2:
+        return []
+
+    try:
+        import requests
+
+        response = requests.get(
+            YAHOO_SEARCH_URL,
+            params={
+                "q": query,
+                "quotesCount": max_results,
+                "newsCount": 0,
+                "enableFuzzyQuery": True,
+            },
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=12,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return []
+
+    quotes = payload.get("quotes") if isinstance(payload, dict) else None
+    return parse_yahoo_search_quotes(quotes, max_results=max_results)
+
+
+def parse_fmp_search_results(items, max_results=8):
+    """Extrait symboles action/ETF d'une réponse FMP search."""
+    results: list[dict[str, str]] = []
+    if not items:
+        return results
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        symbol = str(item.get("symbol") or "").strip()
+        if not symbol:
+            continue
+        name = item.get("name") or symbol
+        exchange = str(
+            item.get("exchangeShortName") or item.get("stockExchange") or ""
+        ).strip()
+        results.append(
+            {
+                "symbol": symbol,
+                "name": str(name).strip(),
+                "exchange": exchange,
+                "type": "EQUITY",
+            }
+        )
+        if len(results) >= max_results:
+            break
+    return results
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_fmp_symbols(query: str, max_results: int = 8):
+    """Recherche FMP par nom de société ou ticker partiel (repli Yahoo)."""
+    query = str(query).strip()
+    if len(query) < 2:
+        return []
+
+    api_key = get_fmp_api_key()
+    if not api_key:
+        return []
+
+    try:
+        import requests
+
+        response = requests.get(
+            FMP_SEARCH_URL,
+            params={"query": query, "limit": max_results, "apikey": api_key},
+            timeout=12,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return []
+
+    if not isinstance(payload, list):
+        return []
+    return parse_fmp_search_results(payload, max_results=max_results)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_market_symbols(query: str, max_results: int = 8):
+    """Recherche par nom ou ticker : Yahoo Finance, puis repli FMP."""
+    hits = search_yahoo_symbols(query, max_results)
+    if hits:
+        return hits
+    return search_fmp_symbols(query, max_results)
 
 
 def ticker_label(ticker, names, show_names=True):
@@ -410,16 +619,34 @@ def ticker_label(ticker, names, show_names=True):
     return f"{tk} — {name}"
 
 
-def add_company_names(df, names, ticker_col="Ticker", show_names=True):
-    """Ajoute une colonne « Nom » après le ticker."""
-    if not show_names or ticker_col not in df.columns:
+def add_company_names(
+    df,
+    names,
+    ticker_col="Ticker",
+    show_names=True,
+    sectors=None,
+):
+    """Ajoute « Nom » et/ou « Secteur » après le ticker."""
+    if ticker_col not in df.columns:
         return df
+    if not show_names and sectors is None:
+        return df
+
     out = df.copy()
-    out.insert(
-        1,
-        "Nom",
-        out[ticker_col].map(lambda t: names.get(str(t).strip(), str(t).strip())),
-    )
+    insert_at = 1
+    if show_names:
+        out.insert(
+            1,
+            "Nom",
+            out[ticker_col].map(lambda t: names.get(str(t).strip(), str(t).strip())),
+        )
+        insert_at = 2
+    if sectors is not None and "Secteur" not in out.columns:
+        out.insert(
+            insert_at,
+            "Secteur",
+            out[ticker_col].map(lambda t: sectors.get(str(t).strip()) or "—"),
+        )
     return out
 
 

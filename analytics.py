@@ -1082,6 +1082,102 @@ def build_fft_spectral_acf_chart(
     return fig
 
 
+def interpret_fft_acf_reading(result, max_acf_lag=None):
+    """
+    Commentaire en langage clair pour la lecture du graphique d'autocorrélation (ACF).
+    """
+    if result is None:
+        return None
+
+    n = int(result["n_obs"])
+    peaks = result.get("peaks")
+    if peaks is None:
+        peaks = pd.DataFrame()
+
+    windowed = _fft_windowed_signal(result)
+    if max_acf_lag is None:
+        max_acf_lag = int(min(n // 2, result.get("max_period_days") or 252, 504))
+    lags, acf = compute_normalized_acf(windowed, max_lag=max_acf_lag)
+    conf = 1.96 / np.sqrt(n)
+
+    parts = [
+        "**Comment lire le graphique du bas :** l'axe horizontal = nombre de jours de décalage ; "
+        "la courbe violette mesure si le cours dé-trendé **ressemble** à ce qu'il était il y a "
+        f"*n* jours. Au point **0 j**, la valeur est toujours **1** (série comparée à elle-même). "
+        f"Les pointillés gris (±{conf:.2f}) délimitent la zone de **bruit** : en dehors, un pic "
+        "peut signaler une répétition réelle."
+    ]
+
+    confirmed = []
+    weak = []
+    if not peaks.empty:
+        for _, peak in peaks.head(3).iterrows():
+            period = float(peak["Période (jours)"])
+            period_label = str(peak.get("Période") or format_fft_period_label(period))
+            strength = float(peak["Puissance relative"])
+            lag_idx = int(min(max(round(period), 1), len(acf) - 1))
+            acf_val = float(acf[lag_idx])
+            if abs(acf_val) > conf:
+                if acf_val > 0:
+                    confirmed.append(
+                        f"à **{period_label}** (ligne orange) l'ACF vaut **{acf_val:+.2f}** : "
+                        f"le motif a tendance à **se répéter** (cycle FFT ≈ {strength:.0%} de force)"
+                    )
+                else:
+                    confirmed.append(
+                        f"à **{period_label}** (ligne orange) l'ACF vaut **{acf_val:+.2f}** : "
+                        f"alternance hausse/baisse à cet intervalle (cycle FFT ≈ {strength:.0%})"
+                    )
+            else:
+                weak.append(
+                    f"à **{period_label}** l'ACF vaut **{acf_val:+.2f}** (dans le bruit) : "
+                    f"le pic FFT ({strength:.0%}) **n'est pas confirmé** ici"
+                )
+
+    if confirmed:
+        parts.append("**Ce qui ressort :** " + " · ".join(confirmed) + ".")
+    if weak:
+        parts.append("**À nuancer :** " + " · ".join(weak) + ".")
+
+    if len(acf) > 1:
+        acf_rest = acf[1:]
+        lags_rest = lags[1:]
+        best_i = int(np.argmax(np.abs(acf_rest)))
+        best_lag = int(lags_rest[best_i])
+        best_val = float(acf_rest[best_i])
+        if abs(best_val) > conf and not confirmed:
+            if best_val > 0:
+                parts.append(
+                    f"**Répétition la plus nette** : vers **{best_lag} jours** "
+                    f"(ACF = **{best_val:+.2f}**) — intervalle où le signal se ressemble le plus, "
+                    "hors bruit."
+                )
+            else:
+                parts.append(
+                    f"**Alternance la plus nette** : vers **{best_lag} jours** "
+                    f"(ACF = **{best_val:+.2f}**) — le signal tend à s'inverser à cet intervalle."
+                )
+        elif not confirmed and not weak:
+            parts.append(
+                "**Lecture globale :** la courbe reste surtout **entre les pointillés gris** — "
+                "pas de cycle clairement répétitif sur la fenêtre ; les pics du graphique du haut "
+                "peuvent venir du hasard ou d'événements ponctuels."
+            )
+        elif confirmed and best_lag > 0 and abs(best_val) > conf:
+            fft_lags = {int(round(float(p))) for p in peaks.head(3)["Période (jours)"]}
+            if best_lag not in fft_lags and abs(best_val) > conf + 0.05:
+                parts.append(
+                    f"**Autre décalage notable** : **{best_lag} jours** (ACF = **{best_val:+.2f}**), "
+                    "non marqué en orange — à comparer avec les cycles FFT."
+                )
+
+    parts.append(
+        "**En pratique :** cherchez un **rebond** de la courbe violette près des lignes orange ; "
+        "s'il dépasse la zone grise, le cycle du haut gagne en crédibilité. Sinon, restez prudent."
+    )
+    return "\n\n".join(parts)
+
+
 def _fft_fond_trend_normalized(prices, log_trend=None, trend_prices=None):
     """
     Tendance de fond reprojetée dans l'espace normalisé du prix (centré / réduit).

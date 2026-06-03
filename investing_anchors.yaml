@@ -1,0 +1,231 @@
+# Repères Juste Valeur Investing (hors exports ma vue) — calibrage modèle unifié.
+# Ajoutez une entrée par titre avec cours + JV Investing au même instant.
+anchors:
+  - ticker: BNP.PA
+    full_ticker: ENXTPA:BNP
+    name: BNP Paribas
+    as_of: "2026-06-02"
+    price: 94.43
+    fair_value: 95.18
+    label: Juste
+    per: 8.8
+    pb: 0.8
+    roe: 0.091
+    roic: 0.016
+    debt_cap: 0.855
+    dividend_yield: 0.105
+    rsi: 54.3
+    analyst_upside: 0.123
+    eps_growth: 0.102
+
+  - ticker: TTE.PA
+    full_ticker: ENXTPA:TTE
+    name: TotalEnergies
+    as_of: "2026-06-02"
+    price: 76.65
+    fair_value: 93.98
+    label: Sous-évaluée
+    per: 13.2
+    pb: 1.6
+    roe: 0.125
+    roic: 0.078
+    debt_cap: 0.242
+    dividend_yield: 0.044
+    rsi: 47.09
+    analyst_upside: 0.124
+    eps_growth: 0.903
+
+  - ticker: SAN.PA
+    full_ticker: ENXTPA:SAN
+    name: Sanofi
+    as_of: "2026-06-02"
+    price: 73.42
+    fair_value: 111.27
+    label: Sous-évaluée
+    per: 18.5
+    pb: 1.2
+    roe: 0.066
+    roic: 0.084
+    debt_cap: 0.185
+    dividend_yield: 0.056
+    rsi: 36.13
+    analyst_upside: 0.348
+    eps_growth: 1.102
+    comparable_fv: 95.62
+    dcf_fv: 124.55
+    ddm_fv: 128.45
+
+  - ticker: MC.PA
+    full_ticker: ENXTPA:MC
+    name: LVMH
+    as_of: "2026-06-02"
+    price: 475.0
+    fair_value: 633.7
+    label: Sous-évaluée
+    per: 21.7
+    pb: 3.5
+    roe: 0.161
+    roic: 0.118
+    debt_cap: 0.134
+    dividend_yield: 0.027
+    rsi: 48.2
+    analyst_upside: 0.263
+    eps_growth: -0.046
+    comparable_fv: 591.83
+    dcf_fv: 681.05
+    ddm_fv: 717.88
+
+  - ticker: AI.PA
+    full_ticker: ENXTPA:AI
+    name: Air Liquide
+    as_of: "2026-06-02"
+    price: 176.54
+    fair_value: 170.38
+    label: Juste
+    per: 28.9
+    pb: 3.9
+    roe: 0.133
+    roic: 0.097
+    debt_cap: 0.117
+    dividend_yield: 0.021
+    rsi: 42.44
+    analyst_upside: 0.133
+    eps_growth: 0.146
+
+  - ticker: SOI.PA
+    full_ticker: ENXTPA:SOI
+    name: Soitec
+    as_of: "2026-06-02"
+    price: 153.05
+    fair_value: 94.08
+    label: Surévaluée
+    pb: 4.1
+    roe: -0.152
+    roic: -0.011
+    debt_cap: 0.103
+    rsi: 51.83
+    analyst_upside: -0.273
+    eps_growth: 1.025
+
+  - ticker: SU.PA
+    full_ticker: ENXTPA:SU
+    name: Schneider Electric
+    as_of: "2026-06-02"
+    price: 287.15
+    fair_value: 250.79
+    label: Juste
+    per: 39.2
+    pb: 6.4
+    roe: 0.152
+    roic: 0.115
+    debt_cap: 0.11
+    dividend_yield: 0.015
+    rsi: 56.46
+    analyst_upside: 0.052
+    eps_growth: 0.373
+
+  - ticker: LR.PA
+    full_ticker: ENXTPA:LR
+    name: Legrand
+    as_of: "2026-06-02"
+    price: 149.0
+    fair_value: 135.91
+    label: Juste
+    per: 30.6
+    pb: 5.0
+    roe: 0.168
+    roic: 0.099
+    debt_cap: 0.145
+    dividend_yield: 0.016
+    rsi: 43.65
+    analyst_upside: 0.114
+    eps_growth: 0.095
+    comparable_fv: 135.80
+    dcf_fv: 136.49
+    ddm_fv: 134.53
+
+  - ticker: ETL.PA
+    full_ticker: ENXTPA:ETL
+    name: Eutelsat
+    as_of: "2026-06-02"
+    price: 3.50
+    fair_value: 2.84
+    label: Surévaluée
+    pb: 1.08
+    roe: -0.337
+    roic: -0.179
+    analyst_upside: -0.289
+    eps_growth: -0.038
+    comparable_fv: 3.32
+    dcf_fv: 2.50
+
+  - ticker: ZAL.DE
+    full_ticker: XTRA:ZAL
+    name: Zalando
+    as_of: "2026-06-02"
+    price: 22.93
+    fair_value: 34.75
+    label: Sous-évaluée
+    per: 47.6
+    pb: 2.08
+    roe: 0.0437
+    roic: 0.0479
+    analyst_upside: 0.526
+    eps_growth: 0.18
+    comparable_fv: 30.53
+    dcf_fv: 40.01
+
+  - ticker: NUTX
+    full_ticker: NASDAQCM:NUTX
+    name: Nutex Health
+    as_of: "2026-06-03"
+    price: 125.03
+    fair_value: 178.48
+    label: Sous-évaluée
+    per: 9.15
+    pb: 2.51
+    roe: 0.215
+    roic: 0.397
+    analyst_upside: 0.397
+    comparable_fv: 151.33
+    dcf_fv: 232.77
+
+  - ticker: NYXH
+    full_ticker: NASDAQGM:NYXH
+    name: Nyxoah
+    as_of: "2026-06-03"
+    price: 2.97
+    fair_value: 3.83
+    label: Sous-évaluée
+    pb: 3.11
+    roe: -1.834
+    roic: -1.100
+    analyst_upside: 1.532
+    comparable_fv: 3.83
+
+  - ticker: EDEN.PA
+    full_ticker: ENXTPA:EDEN
+    name: Edenred
+    as_of: "2026-06-03"
+    price: 23.15
+    fair_value: 32.48
+    label: Sous-évaluée
+    per: 10.92
+    roic: 0.354
+    analyst_upside: 0.126
+    comparable_fv: 31.87
+    dcf_fv: 44.57
+
+  - ticker: CHTR
+    full_ticker: NASDAQGS:CHTR
+    name: Charter Communications
+    as_of: "2026-06-03"
+    price: 141.07
+    fair_value: 246.81
+    label: Aubaine
+    per: 3.80
+    roe: 0.311
+    roic: 0.086
+    analyst_upside: 0.759
+    comparable_fv: 236.96
+    dcf_fv: 261.58

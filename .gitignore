@@ -7,6 +7,8 @@ watchlists.json
 dividendes_cache.json
 dividendes_universe.json
 fundamentals_cache.json
+
+.damodaran_cache/
 *.pkl
 __pycache__/
 .pytest_cache/

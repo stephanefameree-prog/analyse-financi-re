@@ -126,6 +126,7 @@ def get_ticker_listing_info(tickers):
             "Société": t,
             "Marché": _infer_market_from_ticker(t) or "—",
             "Devise": _infer_currency_from_ticker(t) or "—",
+            "Secteur": "—",
         }
         for t in tickers
     }
@@ -136,21 +137,29 @@ def get_ticker_listing_info(tickers):
         chunk_size = 100
         for i in range(0, len(tickers), chunk_size):
             chunk = list(tickers[i : i + chunk_size])
-            payload = Ticker(chunk, timeout=25).price
+            tq = Ticker(chunk, timeout=25)
+            payload = tq.price
+            profiles = tq.asset_profile
             if not isinstance(payload, dict):
-                continue
+                payload = {}
+            if not isinstance(profiles, dict):
+                profiles = {}
             for tk in chunk:
                 block = payload.get(tk)
-                if not isinstance(block, dict):
-                    continue
-                name = block.get("shortName") or block.get("longName")
-                if name:
-                    out[tk]["Société"] = str(name)
-                market = block.get("fullExchangeName") or block.get("exchange")
-                out[tk]["Marché"] = _normalize_market_label(market, tk)
-                currency = block.get("currency")
-                if currency:
-                    out[tk]["Devise"] = str(currency)
+                if isinstance(block, dict):
+                    name = block.get("shortName") or block.get("longName")
+                    if name:
+                        out[tk]["Société"] = str(name)
+                    market = block.get("fullExchangeName") or block.get("exchange")
+                    out[tk]["Marché"] = _normalize_market_label(market, tk)
+                    currency = block.get("currency")
+                    if currency:
+                        out[tk]["Devise"] = str(currency)
+                profile = profiles.get(tk)
+                if isinstance(profile, dict):
+                    sector = profile.get("sector")
+                    if sector:
+                        out[tk]["Secteur"] = str(sector)
     except Exception:
         pass
 
@@ -161,6 +170,7 @@ def _listing_fields_for_ticker(ticker):
     info_map = get_ticker_listing_info((str(ticker).strip(),))
     return info_map.get(str(ticker).strip(), {
         "Société": ticker,
+        "Secteur": "—",
         "Marché": _infer_market_from_ticker(ticker) or "—",
         "Devise": _infer_currency_from_ticker(ticker) or "—",
     })
@@ -174,6 +184,9 @@ def _enrich_dividend_display_df(df):
     listing = get_ticker_listing_info(tuple(out["Ticker"].astype(str)))
 
     out["Société"] = out["Ticker"].map(lambda t: listing.get(str(t).strip(), {}).get("Société", t))
+    out["Secteur"] = out["Ticker"].map(
+        lambda t: listing.get(str(t).strip(), {}).get("Secteur", "—")
+    )
     out["Marché"] = out["Ticker"].map(
         lambda t: listing.get(str(t).strip(), {}).get("Marché", _infer_market_from_ticker(t) or "—")
     )
@@ -181,7 +194,7 @@ def _enrich_dividend_display_df(df):
         lambda t: listing.get(str(t).strip(), {}).get("Devise", _infer_currency_from_ticker(t) or "—")
     )
 
-    for field in ("Société", "Marché", "Devise"):
+    for field in ("Société", "Secteur", "Marché", "Devise"):
         if field in df.columns:
             out[field] = df[field].combine_first(out[field])
 
@@ -189,7 +202,7 @@ def _enrich_dividend_display_df(df):
 
 
 def _dividend_table_column_order(df, leading=None):
-    leading = leading or ["Société", "Marché", "Devise", "Statut"]
+    leading = leading or ["Société", "Secteur", "Marché", "Devise", "Statut"]
     cols = [c for c in leading if c in df.columns]
     cols += [c for c in df.columns if c not in cols and c != "Ticker"]
     return df[cols]

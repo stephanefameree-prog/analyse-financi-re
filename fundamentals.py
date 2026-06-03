@@ -11,7 +11,8 @@ import streamlit as st
 import yfinance as yf
 from yahooquery import Ticker
 
-from analytics import compute_sma
+from analytics import compute_rsi, compute_sma
+from data_loader import get_ticker_metadata, ticker_label
 from display_units import (
     FUNDAMENTALS_CAPTION,
     FUNDAMENTALS_EXTRA_FORMAT,
@@ -22,6 +23,61 @@ from display_units import (
     pick_format,
     rename_columns_for_display,
 )
+
+try:
+    import fair_value as _fair_value
+
+    HAS_FAIR_VALUE = True
+except ImportError:
+    HAS_FAIR_VALUE = False
+
+# Incrémenter si la logique de prédiction fair_value change (invalide le cache Streamlit).
+FAIR_VALUE_ENGINE_VERSION = 38
+FAIR_VALUE_COLUMNS = (
+    "Juste valeur estimée",
+    "Écart juste valeur",
+    "Upside juste valeur",
+    "Libellé juste valeur",
+    "Modèle juste valeur",
+    "Juste valeur Damodaran",
+    "Upside Damodaran",
+    "Profil Damodaran",
+)
+
+# Côte à côte : consensus analystes vs juste valeur estimée (puis les deux upsides).
+VALUATION_COMPARE_COLUMNS = (
+    "Objectif analystes",
+    "Juste valeur estimée",
+    "Upside vs objectif",
+    "Upside juste valeur",
+)
+DAMODARAN_COLUMNS = (
+    "Juste valeur Damodaran",
+    "Upside Damodaran",
+    "Profil Damodaran",
+)
+FAIR_VALUE_DETAIL_COLUMNS = (
+    "Écart juste valeur",
+    "Libellé juste valeur",
+    "Modèle juste valeur",
+)
+ANALYST_CONTEXT_COLUMNS = (
+    "Objectif bas",
+    "Objectif haut",
+    "Recommandation",
+    "Nb analystes",
+)
+
+FUNDAMENTALS_TEXT_COLUMNS = frozenset({
+    "Nom",
+    "Secteur",
+    "Libellé juste valeur",
+    "Modèle juste valeur",
+    "Profil Damodaran",
+    "Recommandation",
+    "Notes interprétation",
+    "Collecte Yahoo",
+})
 
 FUNDAMENTALS_DISK_CACHE_FILE = "fundamentals_cache.json"
 DISK_CACHE_TTL_SECONDS = 86400
@@ -477,6 +533,8 @@ def compute_valuation_indicators(ticker, last_price=None):
     metrics = {}
     try:
         info = yf.Ticker(ticker).info or {}
+        metrics["Secteur Yahoo"] = info.get("sector") or None
+        metrics["Industrie Yahoo"] = info.get("industry") or None
         t = Ticker(ticker, timeout=25)
         ks = t.key_stats
         fd = t.financial_data
@@ -592,6 +650,13 @@ def compute_valuation_indicators(ticker, last_price=None):
                 metrics["VE/EBIT"] = ev / ebit
         if ev and fcf and fcf > 0:
             metrics["VE/FCF"] = ev / fcf
+
+        rev_g = _growth_as_decimal(info.get("revenueGrowth"))
+        op_m = _safe_float(info.get("operatingMargins")) or metrics.get("Marge exploitation")
+        if rev_g is not None and op_m is not None:
+            metrics["Règle des 40"] = rev_g + op_m
+        if growth is not None:
+            metrics["Croissance BPA"] = growth
 
     except Exception:
         pass
@@ -989,6 +1054,8 @@ def fetch_fundamentals_for_ticker(ticker, last_price, price_series=None, throttl
         "Marge nette": profitability.get("Marge nette"),
         "Marge nette (moy. 5 ans)": profitability.get("Marge nette (moy. 5 ans)"),
         "Capitalisation de marché": valuation.get("Capitalisation de marché"),
+        "Secteur Yahoo": valuation.get("Secteur Yahoo"),
+        "Industrie Yahoo": valuation.get("Industrie Yahoo"),
         "PER": per,
         "Ratio PEG": valuation.get("Ratio PEG"),
         "VE/EBITDA": valuation.get("VE/EBITDA"),
@@ -1018,6 +1085,15 @@ def fetch_fundamentals_for_ticker(ticker, last_price, price_series=None, throttl
         "Nb analystes": data.get("analyst_count"),
         "_fetched_at": datetime.now().isoformat(timespec="seconds"),
     }
+
+    if price_series is not None and len(price_series) >= 15:
+        try:
+            rsi = compute_rsi(price_series.dropna(), 14)
+            if rsi is not None and not rsi.empty and pd.notna(rsi.iloc[-1]):
+                row["RSI (14)"] = float(rsi.iloc[-1])
+        except Exception:
+            pass
+
     return row
 
 
@@ -1044,6 +1120,7 @@ FUNDAMENTALS_PERCENT_COLUMNS = frozenset({
     "Marge nette (moy. 5 ans)",
     "Marge EBITDA",
     "Upside vs objectif",
+    "Upside juste valeur",
     "Var. journalière (%)",
     "Var. vs sommet 52 sem. (%)",
     "Var. vs creux 52 sem. (%)",
@@ -1072,6 +1149,8 @@ FUNDAMENTALS_PRICE_COLUMNS = frozenset({
     "Objectif analystes",
     "Objectif bas",
     "Objectif haut",
+    "Juste valeur estimée",
+    "Écart juste valeur",
 })
 
 FUNDAMENTALS_MA_PCT_COLUMNS = frozenset({"Prix % MA50", "Prix % MA200"})
@@ -1157,10 +1236,57 @@ _FUNDAMENTALS_SENTIMENT_COLUMNS = expand_sentiment_columns(
         | FUNDAMENTALS_MONEY_COLUMNS
         | FUNDAMENTALS_MA_PCT_COLUMNS
         | _VALUATION_YIELD_COLUMNS
-        | {"Score Piotroski", "PER % PER moy. 3 ans"}
+        | {"Score Piotroski", "PER % PER moy. 3 ans", "Écart juste valeur"}
     ),
     FUNDAMENTALS_LABELS,
 )
+
+
+_FAIR_VALUE_SENTIMENT_COLUMNS = frozenset(FAIR_VALUE_COLUMNS)
+
+
+def _fair_value_label_sentiment(val) -> str:
+    """Vert = sous-évalué (Aubaine / Sous-évaluée), rouge = surévalué."""
+    text = str(val).strip().lower()
+    if not text or text in ("—", "nan", "none", "-"):
+        return ""
+    if "aubaine" in text or "sous" in text:
+        return _STYLE_FAVORABLE
+    if "sur" in text:
+        return _STYLE_UNFAVORABLE
+    return ""
+
+
+def _fair_value_cell_sentiment(row, column: str) -> str:
+    """Vert si favorable à une hausse (JV > cours), rouge sinon."""
+    column = internal_column_name(column, FUNDAMENTALS_LABELS)
+    if column == "Libellé juste valeur":
+        return _fair_value_label_sentiment(row.get(column))
+
+    if column == "Upside Damodaran":
+        up_d = _safe_float(row.get("Upside Damodaran"))
+        if up_d is not None:
+            if up_d > 0:
+                return _STYLE_FAVORABLE
+            if up_d < 0:
+                return _STYLE_UNFAVORABLE
+            return ""
+
+    upside = _safe_float(row.get("Upside juste valeur"))
+    if upside is not None:
+        if upside > 0:
+            return _STYLE_FAVORABLE
+        if upside < 0:
+            return _STYLE_UNFAVORABLE
+        return ""
+
+    ecart = _safe_float(row.get("Écart juste valeur"))
+    if ecart is not None:
+        if ecart > 0:
+            return _STYLE_FAVORABLE
+        if ecart < 0:
+            return _STYLE_UNFAVORABLE
+    return ""
 
 
 def _fundamentals_display_format(df):
@@ -1168,15 +1294,29 @@ def _fundamentals_display_format(df):
     fmt.update(pick_format(df, FUNDAMENTALS_EXTRA_FORMAT))
     for col in df.columns:
         internal = internal_column_name(col, FUNDAMENTALS_LABELS)
+        if internal in FUNDAMENTALS_TEXT_COLUMNS:
+            fmt[col] = "{}"
         if internal in FUNDAMENTALS_RATIO_COLUMNS:
             if col not in fmt or fmt[col] == "{:.2f}":
                 fmt[col] = "{:.2f}×"
     return fmt
 
 
-def _fundamentals_metric_sentiment(column, val):
+def _fundamentals_metric_sentiment(column, val, row=None):
     """Vert = favorable, rouge = défavorable (repères pédagogiques par colonne)."""
     column = internal_column_name(column, FUNDAMENTALS_LABELS)
+    if column in _FAIR_VALUE_SENTIMENT_COLUMNS:
+        if row is not None:
+            return _fair_value_cell_sentiment(row, column)
+        if column == "Libellé juste valeur":
+            return _fair_value_label_sentiment(val)
+        v = _safe_float(val)
+        if v is not None:
+            if v > 0:
+                return _STYLE_FAVORABLE
+            if v < 0:
+                return _STYLE_UNFAVORABLE
+        return ""
     v = _safe_float(val)
     if v is None:
         return ""
@@ -1301,6 +1441,18 @@ def _fundamentals_metric_sentiment(column, val):
         if v < 0:
             return _STYLE_UNFAVORABLE
 
+    elif column == "Upside juste valeur":
+        if v > 0:
+            return _STYLE_FAVORABLE
+        if v < 0:
+            return _STYLE_UNFAVORABLE
+
+    elif column == "Écart juste valeur":
+        if v > 0:
+            return _STYLE_FAVORABLE
+        if v < 0:
+            return _STYLE_UNFAVORABLE
+
     elif column == "Var. journalière (%)":
         if v >= 0.01:
             return _STYLE_FAVORABLE
@@ -1355,6 +1507,13 @@ _NEGATIVE_RATIO_HINTS = {
 
 _FUNDAMENTALS_COLUMN_HELP = {
     "Collecte fondamentaux": "Date/heure du dernier téléchargement des ratios comptables (Yahoo). Cache disque 24 h.",
+    "Objectif analystes": "Cours cible moyen des analystes (consensus Yahoo, / action).",
+    "Juste valeur estimée": "Juste valeur modèle piliers (/ action) — à comparer à l'objectif analystes.",
+    "Juste valeur Damodaran": "Juste valeur / action via multiples sector_benchmarks.yaml (Damodaran, ajustés pays).",
+    "Upside Damodaran": "Potentiel vs juste valeur Damodaran : (JV Damodaran − cours) ÷ cours.",
+    "Profil Damodaran": "Profil sectoriel utilisé pour les multiples cibles (Damodaran + suffixe Yahoo).",
+    "Upside vs objectif": "Potentiel vs consensus : (objectif − cours) ÷ cours.",
+    "Upside juste valeur": "Potentiel vs juste valeur estimée : (JV − cours) ÷ cours.",
     "Notes interprétation": "Alertes sur ratios non comparables (pertes, EBITDA négatif, etc.).",
     "Var. journalière (%)": "Variation vs clôture veille (Yahoo). Distinct de la volatilité 1 an.",
     "Volat. réalisée 1 an (%, ann.)": "Amplitude des mouvements quotidiens annualisée — ce n'est pas la variation du jour.",
@@ -1418,9 +1577,37 @@ def _fundamental_row_notes(row):
 
 def _fundamentals_table_column_config(df_display):
     config = {}
+    pinned_fv_labels = {
+        FUNDAMENTALS_LABELS.get(c, c)
+        for c in (
+            "Objectif analystes",
+            "Juste valeur estimée",
+            "Upside vs objectif",
+            "Upside juste valeur",
+            "Écart juste valeur",
+            "Libellé juste valeur",
+        )
+    }
     for col in df_display.columns:
         help_text = _FUNDAMENTALS_COLUMN_HELP.get(col)
-        if help_text:
+        if col == "Nom":
+            config[col] = st.column_config.TextColumn(
+                help="Nom de la société (Yahoo Finance)",
+                pinned="left",
+            )
+        elif col == "Secteur":
+            config[col] = st.column_config.TextColumn(
+                help="Secteur Yahoo Finance",
+                pinned="left",
+            )
+        elif col == FUNDAMENTALS_LABELS.get("Dernier cours", "Dernier cours") or col == "Dernier cours":
+            config[col] = st.column_config.TextColumn(
+                help="Dernier cours de clôture (Yahoo, recalculé à l'affichage)",
+                pinned="left",
+            )
+        elif col in pinned_fv_labels:
+            config[col] = st.column_config.TextColumn(help=help_text or None)
+        elif help_text:
             config[col] = st.column_config.TextColumn(help=help_text)
     return config
 
@@ -1428,29 +1615,47 @@ def _fundamentals_table_column_config(df_display):
 def _format_fundamental_value(col, val):
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return "-"
+    if col in FUNDAMENTALS_TEXT_COLUMNS:
+        text = str(val).strip()
+        if not text or text.lower() in ("nan", "none", "—"):
+            return "-"
+        return text
+    v = _safe_float(val)
+    if v is None:
+        text = str(val).strip()
+        return text if text and text.lower() not in ("nan", "none") else "-"
     if col in FUNDAMENTALS_PERCENT_COLUMNS:
-        return f"{val:.2%}"
+        return f"{v:.2%}"
     if col in FUNDAMENTALS_LARGE_MONEY_COLUMNS:
-        return f"{val:,.0f}"
+        return f"{v:,.0f}"
     if col in FUNDAMENTALS_MONEY_COLUMNS:
-        return f"{val:,.0f}"
+        return f"{v:,.0f}"
     if col in FUNDAMENTALS_SHARE_COLUMNS:
-        return f"{val:,.0f}"
+        return f"{v:,.0f}"
     if col in FUNDAMENTALS_PRICE_COLUMNS:
-        return f"{val:.2f}"
+        return f"{v:.2f}"
     if col in FUNDAMENTALS_MA_PCT_COLUMNS:
-        return f"{val:.1f}"
+        return f"{v:.1f}"
     if col == "Score Piotroski":
-        return f"{val:.0f} / 9"
+        return f"{v:.0f} / 9"
     if col in FUNDAMENTALS_RATIO_COLUMNS:
-        return f"{val:.2f}"
-    return f"{val:.2f}"
+        return f"{v:.2f}"
+    return f"{v:.2f}"
 
 
-def _render_fundamental_metric(label, column, raw_value, formatted=None):
+def _fundamentals_styler_formatters(df):
+    """Formateurs cellule par cellule (évite {:.2f} sur colonnes texte)."""
+    formatters = {}
+    for col in df.columns:
+        internal = internal_column_name(col, FUNDAMENTALS_LABELS)
+        formatters[col] = lambda v, c=internal: _format_fundamental_value(c, v)
+    return formatters
+
+
+def _render_fundamental_metric(label, column, raw_value, formatted=None, row=None):
     """Affiche une métrique Streamlit avec code couleur vert / rouge."""
     formatted = formatted if formatted is not None else _format_fundamental_value(column, raw_value)
-    style = _fundamentals_metric_sentiment(column, raw_value)
+    style = _fundamentals_metric_sentiment(column, raw_value, row=row)
     if not style:
         st.metric(label, formatted)
         hint = _fundamental_metric_hint(column, raw_value)
@@ -1497,6 +1702,7 @@ def _render_fundamentals_detail_table(row, cols):
         style = _fundamentals_metric_sentiment(
             detail_df.loc[idx, "_col"],
             detail_df.loc[idx, "_raw"],
+            row=row,
         )
         return ["", style, ""]
 
@@ -1506,8 +1712,20 @@ def _render_fundamentals_detail_table(row, cols):
     st.dataframe(styled, hide_index=True, use_container_width=True)
 
 
-def _style_fundamentals_sentiment(styler):
+def _style_fundamentals_sentiment(styler, df_raw=None):
     def _color_column(series):
+        display_name = series.name
+        internal = internal_column_name(display_name, FUNDAMENTALS_LABELS)
+
+        if (
+            internal in _FAIR_VALUE_SENTIMENT_COLUMNS
+            and df_raw is not None
+            and len(df_raw) == len(series)
+        ):
+            return [
+                _fair_value_cell_sentiment(df_raw.iloc[i], internal) for i in range(len(series))
+            ]
+
         if series.name not in _FUNDAMENTALS_SENTIMENT_COLUMNS:
             return [""] * len(series)
         return [_fundamentals_metric_sentiment(series.name, v) for v in series]
@@ -1702,6 +1920,10 @@ Les cellules sont colorées automatiquement selon des **seuils indicatifs** (à 
 | Dette / FCF | ≤ 3 | > 8 |
 | Dette / Capitaux | ≤ 0,8 | > 1,5 |
 | Upside vs objectif | ≥ +10 % | < 0 % |
+| Upside juste valeur | > 0 % (JV > cours) | < 0 % (JV < cours) |
+| Écart juste valeur | > 0 (JV > cours) | < 0 (JV < cours) |
+| Libellé juste valeur | Aubaine / Sous-évaluée | Surévaluée |
+| Juste valeur estimée | JV > cours | JV < cours |
 | Var. journalière | ≥ +1 % | ≤ −1 % |
 | Var. vs sommet 52 sem. | ≤ −15 % (éloigné du plus haut) | ≥ −2 % (proche du plus haut) |
 | Var. vs creux 52 sem. | ≥ +30 % | ≤ +5 % (proche du plus bas) |
@@ -1754,7 +1976,12 @@ Les cellules sont colorées automatiquement selon des **seuils indicatifs** (à 
 
 ---
 
-### Consensus analystes (opinion du marché)
+### Consensus analystes vs juste valeur estimée
+
+Dans le tableau, ces colonnes sont **groupées** pour comparer d'un coup d'œil :
+
+| Objectif analystes | Juste valeur estimée |
+| Upside vs objectif | Upside juste valeur |
 
 | Terme | Signification |
 |-------|---------------|
@@ -1763,6 +1990,22 @@ Les cellules sont colorées automatiquement selon des **seuils indicatifs** (à 
 | **Upside vs objectif** | `(Objectif moyen − prix actuel) ÷ prix actuel`. **+20 %** = les analystes voient **20 %** de hausse potentielle ; **négatif** = cours au-dessus du consensus. |
 | **Recommandation** | Consensus textuel Yahoo : *strong buy*, *buy*, *hold*, *sell*… |
 | **Nb analystes** | Nombre d'analystes ayant contribué — plus il est élevé, plus le consensus est **robuste**. |
+
+---
+
+### Juste valeur estimée
+
+| Terme | Signification |
+|-------|---------------|
+| **Juste valeur estimée** | Cours intrinsèque estimé par action. **Modèle Ridge unifié** pour **tous** les titres : ratios Yahoo + sous-modèles (DCF, comparables, dividendes) lorsque disponibles. |
+| **Écart juste valeur** | **Valeur absolue** : `Juste valeur estimée − dernier cours` (/ action). **Positif** = cours sous la juste valeur (marge en €/$) ; **négatif** = cours au-dessus. |
+| **Upside juste valeur** | **Valeur relative** : `(Juste valeur estimée − cours) ÷ cours`. Seuils libellé : **≥ +18,5 %** sous-évaluée, **≤ −19 %** surévaluée. |
+| **Libellé juste valeur** | Aubaine / Sous-évaluée / Juste / Surévaluée. |
+| **Modèle juste valeur** | Toujours **unifié** : même logique et mêmes multiples cibles pour tous les titres. |
+| **Juste valeur Damodaran** | Mesure **complémentaire** : médiane des prix implicites PER / P/B / P/S / dividende vs multiples **sector_benchmarks.yaml** (Damodaran US, ajustés au pays du ticker). |
+| **Upside Damodaran** | `(Juste valeur Damodaran − cours) ÷ cours`. |
+| **Profil Damodaran** | Profil sectoriel retenu (ex. consommation, pharma, tech…) pour choisir les multiples cibles. |
+| **Règle des 40** | *(tech, si calculable)* `croissance CA Yahoo + marge d'exploitation Yahoo`. Absent si données manquantes. |
 
 ---
 
@@ -1779,6 +2022,282 @@ Si le prix est **au-dessus** de l'objectif moyen, le titre est déjà « dans le
             "Couleurs : repères automatiques — section « Code couleur ». "
             "Valeurs absentes (-) si historique ou donnée insuffisants."
         )
+
+
+def _fair_value_module():
+    """Retourne le module fair_value (sans reload — compatible Streamlit)."""
+    return _fair_value if HAS_FAIR_VALUE else None
+
+
+def _fair_value_project_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _fair_value_cache_signature() -> tuple[float, float, float, float, float, float, str]:
+    fv = _fair_value_module()
+    if fv is None:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, str(_fair_value_project_dir())
+    d = _fair_value_project_dir()
+    v1, v2 = fv.glob_ma_vue_exports(d)
+    t2, te, tr, t3 = fv.glob_tech_exports(d)
+    m1 = v1.stat().st_mtime if v1 and v1.is_file() else 0.0
+    m2 = v2.stat().st_mtime if v2 and v2.is_file() else 0.0
+    mt2 = t2.stat().st_mtime if t2 and t2.is_file() else 0.0
+    mte = te.stat().st_mtime if te and te.is_file() else 0.0
+    mtr = tr.stat().st_mtime if tr and tr.is_file() else 0.0
+    mt3 = t3.stat().st_mtime if t3 and t3.is_file() else 0.0
+    return m1, m2, mt2, mte, mtr, mt3, str(d)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _cached_ma_vue_dataframe(
+    vue1_mtime: float,
+    vue2_mtime: float,
+    tech_mtime: float,
+    tech_eff_mtime: float,
+    tech_risk_mtime: float,
+    tech_vue3_mtime: float,
+    project_dir: str,
+    engine_version: int,
+):
+    fv = _fair_value_module()
+    if fv is None:
+        return None
+    return fv.try_load_ma_vue_for_dashboard(project_dir, enrich_yahoo_price=False)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _cached_tech_ma_vue_dataframe(
+    vue1_mtime: float,
+    vue2_mtime: float,
+    tech_mtime: float,
+    tech_eff_mtime: float,
+    tech_risk_mtime: float,
+    tech_vue3_mtime: float,
+    project_dir: str,
+    engine_version: int,
+):
+    fv = _fair_value_module()
+    if fv is None:
+        return None
+    return fv.try_load_tech_ma_vue_for_dashboard(project_dir, enrich_yahoo_price=False)
+
+
+@st.cache_data(ttl=86400, show_spinner="Calibrage juste valeur…")
+def _cached_fair_value_models(
+    vue1_mtime: float,
+    vue2_mtime: float,
+    tech_mtime: float,
+    tech_eff_mtime: float,
+    tech_risk_mtime: float,
+    tech_vue3_mtime: float,
+    project_dir: str,
+    engine_version: int,
+):
+    fv = _fair_value_module()
+    if fv is None:
+        return {}, {"status": "missing_module", "message": "Module fair_value indisponible."}
+    models, meta = fv.load_dashboard_fair_value_models(project_dir, enrich_yahoo_price=False)
+    return models, meta
+
+
+def _reorder_fair_value_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Nom, cours, objectif/JV/upsides, puis Damodaran, détail JV et reste."""
+    head = [c for c in ("Nom", "Secteur", "Dernier cours") if c in df.columns]
+    compare = [c for c in VALUATION_COMPARE_COLUMNS if c in df.columns]
+    damodaran = [c for c in DAMODARAN_COLUMNS if c in df.columns]
+    fv_detail = [c for c in FAIR_VALUE_DETAIL_COLUMNS if c in df.columns]
+    analyst_ctx = [c for c in ANALYST_CONTEXT_COLUMNS if c in df.columns]
+    skip = set(head) | set(compare) | set(damodaran) | set(fv_detail) | set(analyst_ctx) | {"Ticker"}
+    rest = [c for c in df.columns if c not in skip]
+    tail = [c for c in ("Ticker",) if c in df.columns]
+    ordered = head + compare + damodaran + fv_detail + analyst_ctx + rest + tail
+    return df[ordered]
+
+
+_VALUATION_UPSIDE_RADAR_AXES = (
+    ("Objectif analystes", "Upside vs objectif"),
+    ("Juste valeur estimée", "Upside juste valeur"),
+    ("Damodaran", "Upside Damodaran"),
+)
+_RADAR_TICK_LABELS = {
+    "Objectif analystes": "Objectif analystes",
+    "Juste valeur estimée": "Juste valeur",
+    "Damodaran": "Damodaran",
+}
+_RADAR_POS_FILL = "rgba(212, 237, 218, 0.85)"
+_RADAR_POS_LINE = "#155724"
+_RADAR_NEG_FILL = "rgba(248, 215, 218, 0.85)"
+_RADAR_NEG_LINE = "#721c24"
+_RADAR_POLYGON_FILL = "rgba(0, 0, 0, 0)"
+_RADAR_POLYGON_LINE = "#333333"
+
+
+def _radar_axis_angles(n: int) -> list[float]:
+    """Angles en degrés [0, 360), uniformément espacés (premier axe en haut)."""
+    step = 360.0 / n
+    return [float((90.0 - i * step) % 360.0) for i in range(n)]
+
+
+def build_valuation_upside_radar(row, ticker_label: str):
+    """Radar : fond circulaire vert/rouge (±0 %) + polygone des trois upsides."""
+    labels: list[str] = []
+    values: list[float] = []
+    for label, col in _VALUATION_UPSIDE_RADAR_AXES:
+        val = _safe_float(row.get(col) if hasattr(row, "get") else row[col] if col in row.index else None)
+        if val is not None:
+            labels.append(label)
+            values.append(val)
+
+    if len(labels) < 2:
+        return None
+
+    angles = _radar_axis_angles(len(labels))
+    values_closed = values + [values[0]]
+    angles_closed = angles + [angles[0]]
+    labels_closed = labels + [labels[0]]
+
+    r_min = min(values)
+    r_max = max(values)
+    pad = max(0.05, (r_max - r_min) * 0.15 if r_max > r_min else 0.1)
+    r_lo = min(r_min - pad, 0.0) if r_min < 0 else 0.0
+    r_hi = max(r_max + pad, 0.05)
+
+    def _annulus(r_inner: float, r_outer: float, fill: str, line: str):
+        n = 128
+        theta = np.linspace(0, 360, n)
+        return go.Scatterpolar(
+            r=np.concatenate([np.full(n, r_outer), np.full(n, r_inner)[::-1]]),
+            theta=np.concatenate([theta, theta[::-1]]),
+            fill="toself",
+            fillcolor=fill,
+            line=dict(color=line, width=0.5),
+            hoverinfo="skip",
+        )
+
+    fig = go.Figure()
+    if r_lo < 0:
+        fig.add_trace(_annulus(r_lo, 0.0, _RADAR_NEG_FILL, _RADAR_NEG_LINE))
+    if r_hi > 0:
+        fig.add_trace(_annulus(0.0, r_hi, _RADAR_POS_FILL, _RADAR_POS_LINE))
+
+    marker_colors = [
+        _RADAR_POS_LINE if v > 0 else (_RADAR_NEG_LINE if v < 0 else "#666666") for v in values
+    ]
+    fig.add_trace(
+        go.Scatterpolar(
+            r=values_closed,
+            theta=angles_closed,
+            customdata=labels_closed,
+            fill="toself",
+            fillcolor=_RADAR_POLYGON_FILL,
+            line=dict(color=_RADAR_POLYGON_LINE, width=3),
+            mode="lines+markers",
+            marker=dict(size=10, color=marker_colors + [marker_colors[0]], line=dict(color="#ffffff", width=2)),
+            hovertemplate="%{customdata}<br>Upside : %{r:.1%}<extra></extra>",
+        )
+    )
+    tick_labels = [_RADAR_TICK_LABELS.get(lbl, lbl) for lbl in labels]
+    fig.update_layout(
+        polar=dict(
+            angularaxis=dict(
+                tickmode="array",
+                tickvals=angles,
+                ticktext=tick_labels,
+                direction="clockwise",
+                rotation=90,
+                tickfont=dict(size=12),
+            ),
+            radialaxis=dict(
+                visible=True,
+                range=[r_lo, r_hi],
+                tickformat=".0%",
+            ),
+        ),
+        title=f"Comparaison des upsides — {ticker_label}",
+        showlegend=False,
+        height=460,
+        margin=dict(t=70, b=70, l=100, r=100),
+    )
+    return fig
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _cached_yahoo_sectors(tickers_key: str) -> dict[str, tuple[str | None, str | None]]:
+    """Secteur / industrie Yahoo par ticker (complète le cache fondamentaux)."""
+    sectors: dict[str, tuple[str | None, str | None]] = {}
+    for ticker in tickers_key.split("|"):
+        if not ticker:
+            continue
+        try:
+            info = yf.Ticker(ticker).info or {}
+            sectors[ticker] = (info.get("sector"), info.get("industry"))
+        except Exception:
+            sectors[ticker] = (None, None)
+    return sectors
+
+
+def _fill_yahoo_sectors(rows: list) -> list:
+    missing = sorted(
+        {str(r.get("Ticker", "")).strip() for r in rows if r.get("Ticker") and not r.get("Secteur Yahoo")}
+    )
+    if not missing:
+        return rows
+    sectors = _cached_yahoo_sectors("|".join(missing))
+    for row in rows:
+        ticker = str(row.get("Ticker", "")).strip()
+        if ticker and not row.get("Secteur Yahoo"):
+            sec, ind = sectors.get(ticker, (None, None))
+            if sec:
+                row["Secteur Yahoo"] = sec
+            if ind:
+                row["Industrie Yahoo"] = ind
+    return rows
+
+
+def _append_fair_value_columns(df: pd.DataFrame, rows: list) -> tuple[pd.DataFrame, dict | None]:
+    """Ajoute juste valeur estimée, écart absolu, upside et libellé."""
+    fv = _fair_value_module()
+    if fv is None or df.empty:
+        return df, None
+
+    try:
+        sig = _fair_value_cache_signature()
+        models, meta_all = _cached_fair_value_models(*sig, FAIR_VALUE_ENGINE_VERSION)
+        if not models:
+            first_err = next(
+                (m for m in meta_all.values() if m.get("status") != "ok"),
+                {"status": "error", "message": "Aucun modèle juste valeur disponible."},
+            )
+            return df, first_err
+
+        ma_vue_df = _cached_ma_vue_dataframe(*sig, FAIR_VALUE_ENGINE_VERSION)
+        tech_df = _cached_tech_ma_vue_dataframe(*sig, FAIR_VALUE_ENGINE_VERSION)
+        enrich_indices = {}
+        if ma_vue_df is not None:
+            enrich_indices[fv.SECTOR_MINIERES] = fv.build_ma_vue_yahoo_index(ma_vue_df)
+        if tech_df is not None:
+            enrich_indices[fv.SECTOR_TECH] = fv.build_ma_vue_yahoo_index(tech_df)
+
+        rows = _fill_yahoo_sectors(list(rows))
+        pred = fv.predict_fair_value_for_fundamentals(rows, models, enrich_indices)
+        if pred.empty:
+            return df, meta_all
+
+        out = df.merge(pred, on="Ticker", how="left")
+        price_col = "Dernier cours" if "Dernier cours" in out.columns else "Prix"
+        if price_col in out.columns and "Juste valeur estimée" in out.columns:
+            price = pd.to_numeric(out[price_col], errors="coerce")
+            jv = pd.to_numeric(out["Juste valeur estimée"], errors="coerce")
+            out["Écart juste valeur"] = jv - price
+
+        meta = {
+            "status": "ok",
+            "sectors": meta_all,
+        }
+        return _reorder_fair_value_columns(out), meta
+    except Exception as exc:
+        return df, {"status": "error", "message": str(exc)}
 
 
 @st.fragment
@@ -1862,6 +2381,9 @@ def render_fundamentals_dashboard(prices):
         except ImportError:
             pass
         cached_fetch_fundamentals_for_ticker.clear()
+        _cached_fair_value_models.clear()
+        _cached_ma_vue_dataframe.clear()
+        _cached_tech_ma_vue_dataframe.clear()
         if cache_key in st.session_state:
             del st.session_state[cache_key]
         disk_loaded_key = f"{cache_key}_disk_loaded"
@@ -1937,9 +2459,36 @@ def render_fundamentals_dashboard(prices):
     else:
         df["Collecte Yahoo"] = "—"
     df["Notes interprétation"] = df.apply(_fundamental_row_notes, axis=1)
-    meta_cols = ["Ticker", "Collecte Yahoo", "Notes interprétation"]
-    other_cols = [c for c in df.columns if c not in meta_cols]
-    df = df[meta_cols + other_cols]
+    df, fair_value_meta = _append_fair_value_columns(df, data)
+    if fair_value_meta and fair_value_meta.get("status") == "ok":
+        st.caption(
+            "**Juste valeur estimée** — évaluation intrinsèque **unifiée** pour tous les titres "
+            "(ratios Yahoo, DCF, comparables et dividendes). "
+            "**Juste valeur Damodaran** — repère complémentaire (multiples sectoriels Damodaran, ajustés pays). "
+            "Libellé : Aubaine / Sous-évaluée / Juste / Surévaluée."
+        )
+    elif fair_value_meta and fair_value_meta.get("status") not in (None, "ok", "missing_module"):
+        msg = fair_value_meta.get("message")
+        if not msg and fair_value_meta.get("sectors"):
+            err = next(
+                (m.get("message") for m in fair_value_meta["sectors"].values() if m.get("status") != "ok"),
+                "indisponible",
+            )
+            msg = err
+        st.caption(f"Juste valeur estimée : indisponible ({msg or 'erreur de calibrage'}).")
+    df = _reorder_fair_value_columns(df)
+    need_sector_col = "Secteur Yahoo" not in df.columns
+    ticker_names, sectors = get_ticker_metadata(
+        df["Ticker"].tolist(),
+        need_names=True,
+        need_sectors=need_sector_col,
+    )
+    df["Nom"] = df["Ticker"].map(lambda t: ticker_names.get(str(t).strip(), str(t).strip()))
+    if "Secteur Yahoo" in df.columns:
+        df["Secteur"] = df["Secteur Yahoo"].fillna("—")
+    else:
+        df["Secteur"] = df["Ticker"].map(lambda t: sectors.get(str(t).strip()) or "—")
+    df = _reorder_fair_value_columns(df)
     sort_options = [
         "PER",
         "VE/EBITDA",
@@ -1953,6 +2502,11 @@ def render_fundamentals_dashboard(prices):
         "Marge nette",
         "Volat. réalisée 1 an",
         "Dette / FCF",
+        "Upside juste valeur",
+        "Écart juste valeur",
+        "Juste valeur estimée",
+        "Juste valeur Damodaran",
+        "Upside Damodaran",
         "Upside vs objectif",
         "Objectif analystes",
     ]
@@ -1979,12 +2533,22 @@ def render_fundamentals_dashboard(prices):
         "Volat. réalisée 1 an",
         "PER % PER moy. 3 ans",
     )
+    if sort_col in (
+        "Upside juste valeur",
+        "Écart juste valeur",
+        "Juste valeur estimée",
+        "Juste valeur Damodaran",
+        "Upside Damodaran",
+    ):
+        ascending = False
     if sort_col in df.columns:
         df = df.sort_values(sort_col, ascending=ascending, na_position="last")
 
-    df_display = rename_columns_for_display(df, FUNDAMENTALS_LABELS)
+    df_table = df.drop(columns=["Ticker"])
+    df_display = rename_columns_for_display(df_table, FUNDAMENTALS_LABELS)
     styled = _style_fundamentals_sentiment(
-        df_display.style.format(_fundamentals_display_format(df_display), na_rep="-")
+        df_display.style.format(_fundamentals_styler_formatters(df_display), na_rep="-"),
+        df_raw=df_table,
     )
     st.caption(FUNDAMENTALS_CAPTION)
     st.caption(
@@ -1997,14 +2561,21 @@ def render_fundamentals_dashboard(prices):
         column_config=_fundamentals_table_column_config(df_display),
     )
 
-    csv = df_display.to_csv(index=False).encode("utf-8")
+    csv_export = df.drop(columns=["Ticker"]).copy()
+    csv_export.insert(1, "Symbole", df["Ticker"].values)
+    csv = rename_columns_for_display(csv_export, FUNDAMENTALS_LABELS).to_csv(index=False).encode("utf-8")
     st.download_button("Telecharger (CSV)", csv, "analyse_fondamentale.csv")
 
     st.markdown("---")
-    detail = st.selectbox("Detail par actif", df["Ticker"])
+    detail = st.selectbox(
+        "Detail par actif",
+        df["Ticker"].tolist(),
+        format_func=lambda t: ticker_label(t, ticker_names, True),
+    )
     row = df[df["Ticker"] == detail].iloc[0]
+    detail_label = ticker_label(detail, ticker_names, True)
     if row.get("Notes interprétation") not in (None, "—", ""):
-        st.info(f"**{detail}** — {row['Notes interprétation']}")
+        st.info(f"**{detail_label}** — {row['Notes interprétation']}")
     if row.get("Collecte Yahoo") not in (None, "—", ""):
         st.caption(
             f"Collecte fondamentaux Yahoo : **{row['Collecte Yahoo']}** · "
@@ -2121,6 +2692,80 @@ def render_fundamentals_dashboard(prices):
             "VE/FCF",
         ]
         _render_fundamentals_detail_table(row, val_cols)
+
+    if any(c in row.index for c in FAIR_VALUE_COLUMNS):
+        st.markdown("#### Juste valeur (modèle piliers)")
+        j1, j2, j3, j4 = st.columns(4)
+        with j1:
+            _render_fundamental_metric(
+                "Juste valeur",
+                "Juste valeur estimée",
+                row.get("Juste valeur estimée"),
+                row=row,
+            )
+        with j2:
+            _render_fundamental_metric(
+                "Écart absolu",
+                "Écart juste valeur",
+                row.get("Écart juste valeur"),
+                row=row,
+            )
+        with j3:
+            _render_fundamental_metric(
+                "Upside relatif",
+                "Upside juste valeur",
+                row.get("Upside juste valeur"),
+                row=row,
+            )
+        with j4:
+            label = row.get("Libellé juste valeur")
+            label_txt = label if label not in (None, "", "nan") else "—"
+            _render_fundamental_metric(
+                "Libellé",
+                "Libellé juste valeur",
+                label_txt,
+                formatted=label_txt,
+                row=row,
+            )
+        with st.expander("Détail juste valeur", expanded=False):
+            _render_fundamentals_detail_table(row, list(FAIR_VALUE_COLUMNS))
+        if row.get("Juste valeur Damodaran") is not None or row.get("Profil Damodaran"):
+            st.markdown("#### Repère Damodaran (multiples sectoriels)")
+            d1, d2, d3 = st.columns(3)
+            with d1:
+                _render_fundamental_metric(
+                    "Juste valeur Damodaran",
+                    "Juste valeur Damodaran",
+                    row.get("Juste valeur Damodaran"),
+                    row=row,
+                )
+            with d2:
+                _render_fundamental_metric(
+                    "Upside Damodaran",
+                    "Upside Damodaran",
+                    row.get("Upside Damodaran"),
+                    row=row,
+                )
+            with d3:
+                profil = row.get("Profil Damodaran") or "—"
+                _render_fundamental_metric(
+                    "Profil",
+                    "Profil Damodaran",
+                    profil,
+                    formatted=str(profil),
+                    row=row,
+                )
+
+    fig_radar = build_valuation_upside_radar(row, detail_label)
+    if fig_radar is not None:
+        st.markdown("#### Comparaison des upsides (radar)")
+        st.plotly_chart(fig_radar, use_container_width=True)
+        st.caption(
+            "Chaque axe = potentiel relatif vs le dernier cours : "
+            "**objectif analystes**, **juste valeur estimée** (modèle Ridge) et **Damodaran** "
+            "(multiples sectoriels). **Fond circulaire** : vert au-dessus de 0 %, rouge en dessous. "
+            "Le **triangle** relie les trois upsides."
+        )
 
     st.markdown("#### Consensus analystes")
     c1, c2, c3, c4 = st.columns(4)

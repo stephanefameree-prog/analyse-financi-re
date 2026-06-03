@@ -5,7 +5,12 @@ import pandas as pd
 import streamlit as st
 
 from asset_summary import cached_build_asset_summary_table
-from data_loader import add_company_names, get_ticker_names, ticker_label
+from data_loader import (
+    add_company_names,
+    get_ticker_metadata,
+    search_market_symbols,
+    ticker_label,
+)
 from display_units import (
     WATCHLIST_FORMAT,
     WATCHLIST_LABELS,
@@ -46,6 +51,35 @@ def save_watchlists_data(data):
 
 def _normalize_ticker(ticker):
     return str(ticker).upper().strip()
+
+
+def _looks_like_ticker(text):
+    """True si la saisie ressemble à un symbole Yahoo explicite (ex: MC.PA, ^FCHI)."""
+    raw = str(text).strip()
+    if not raw or " " in raw:
+        return False
+    tk = _normalize_ticker(raw)
+    if tk.startswith("^"):
+        return True
+    return "." in tk
+
+
+def _format_search_hit(hit):
+    parts = [hit["name"], hit["symbol"]]
+    if hit.get("exchange"):
+        parts.append(f"({hit['exchange']})")
+    return " — ".join((parts[0], " ".join(parts[1:])))
+
+
+def pick_watchlist_ticker(query, search_results, selected_label=None):
+    """Retourne le ticker à ajouter : sélection recherche ou saisie directe."""
+    if search_results and selected_label:
+        labels = [_format_search_hit(h) for h in search_results]
+        if selected_label in labels:
+            return search_results[labels.index(selected_label)]["symbol"]
+    if _looks_like_ticker(query):
+        return _normalize_ticker(query)
+    return None
 
 
 def get_watchlist_names(data):
@@ -135,6 +169,7 @@ def import_tickers_to_watchlist(data, name, tickers):
 WATCHLIST_DISPLAY_COLUMNS = [
     "Ticker",
     "Nom",
+    "Secteur",
     "Prix",
     "Min 52 sem.",
     "Max 52 sem.",
@@ -158,7 +193,7 @@ def cached_build_watchlist_table(prices_sig, rsi_period, prices):
     if df.empty:
         return df
     for col in WATCHLIST_DISPLAY_COLUMNS:
-        if col not in df.columns and col != "Nom":
+        if col not in df.columns and col not in ("Nom", "Secteur"):
             df[col] = None
     return df
 
@@ -172,13 +207,13 @@ def build_watchlist_table(prices, rsi_period=14):
     if df.empty:
         return df
     for col in WATCHLIST_DISPLAY_COLUMNS:
-        if col not in df.columns and col != "Nom":
+        if col not in df.columns and col not in ("Nom", "Secteur"):
             df[col] = None
     return df
 
 
-def render_watchlist_sidebar(show_company_names, index_tickers=None):
-    """Gère les watchlists dans la sidebar. Retourne (liste_tickers, nom_watchlist_active)."""
+def render_watchlist_sidebar_controls(index_tickers=None):
+    """CRUD watchlists dans la sidebar (sans tableau des titres)."""
     data = load_watchlists_data()
     names = get_watchlist_names(data)
     if not names:
@@ -224,21 +259,60 @@ def render_watchlist_sidebar(show_company_names, index_tickers=None):
             else:
                 st.error(msg)
 
-    with st.sidebar.expander("➕ Ajouter un ticker", expanded=False):
-        add_tk = st.text_input(
-            "Ticker Yahoo (ex: AIR.PA, NVDA)", key="wl_add_ticker"
-        ).upper().strip()
+    with st.sidebar.expander("➕ Ajouter une valeur", expanded=False):
+        query = st.text_input(
+            "Nom de la société (ex: Apple, LVMH, Edenred)",
+            key="wl_add_query",
+            placeholder="Nom ou ticker Yahoo (AAPL, MC.PA)",
+        ).strip()
+        if st.button("Rechercher", key="wl_search_btn"):
+            if len(query) < 2:
+                st.error("Saisissez au moins 2 caractères.")
+            else:
+                hits = search_market_symbols(query)
+                st.session_state["wl_search_results"] = hits
+                st.session_state["wl_search_query"] = query
+                if not hits:
+                    st.warning(
+                        "Aucun résultat (Yahoo ni FMP). "
+                        "Vérifiez l'orthographe ou définissez FMP_API_KEY pour le repli FMP."
+                    )
+
+        search_results = st.session_state.get("wl_search_results") or []
+        if search_results and st.session_state.get("wl_search_query") == query:
+            st.selectbox(
+                "Choisir la valeur",
+                [_format_search_hit(h) for h in search_results],
+                key="wl_search_pick",
+            )
+        elif query and not _looks_like_ticker(query):
+            st.caption("Cliquez **Rechercher**, puis choisissez la ligne correspondante.")
+
         if st.button("Ajouter à la watchlist", key="wl_add_btn"):
-            if add_tk:
+            active_results = (
+                search_results if st.session_state.get("wl_search_query") == query else []
+            )
+            selected = (
+                st.session_state.get("wl_search_pick")
+                if active_results
+                else None
+            )
+            ticker = pick_watchlist_ticker(query, active_results, selected)
+            if ticker:
                 data = load_watchlists_data()
-                ok, msg = add_ticker_to_watchlist(data, active_name, add_tk)
+                ok, msg = add_ticker_to_watchlist(data, active_name, ticker)
                 if ok:
+                    st.session_state.pop("wl_search_results", None)
+                    st.session_state.pop("wl_search_query", None)
                     st.success(msg)
                     st.rerun()
                 else:
                     st.error(msg)
             else:
-                st.error("Saisissez un ticker.")
+                st.error(
+                    "Recherchez la société par son nom, ou saisissez un ticker Yahoo "
+                    "(ex: AAPL, MC.PA, EDEN.PA)."
+                )
 
     tickers = get_watchlist_tickers(load_watchlists_data(), active_name)
 
@@ -279,39 +353,81 @@ def render_watchlist_sidebar(show_company_names, index_tickers=None):
                 except Exception as e:
                     st.error(f"Erreur lecture portefeuille : {e}")
 
-    if tickers:
-        wl_names = get_ticker_names(tickers) if show_company_names else {}
-        df_wl = pd.DataFrame({"Ticker": tickers})
-        df_wl = add_company_names(df_wl, wl_names, show_names=show_company_names)
-        st.sidebar.write(f"**{len(tickers)} titres** dans « {active_name} »")
-        st.sidebar.dataframe(df_wl, hide_index=True, use_container_width=True)
+    return tickers, active_name
 
-        remove_tk = st.sidebar.selectbox(
-            "Retirer un ticker :",
-            ["-"] + tickers,
-            format_func=lambda t: "-"
-            if t == "-"
-            else ticker_label(t, wl_names, show_company_names),
-            key="wl_remove_select",
-        )
-        if remove_tk != "-" and st.sidebar.button("Retirer", key="wl_remove_btn"):
-            data = load_watchlists_data()
-            ok, msg = remove_ticker_from_watchlist(data, active_name, remove_tk)
-            if ok:
-                st.success(msg)
-                st.rerun()
-            else:
-                st.error(msg)
-    else:
+
+def render_watchlist_sidebar_table(
+    tickers,
+    active_name,
+    show_company_names,
+    wl_names=None,
+    wl_sectors=None,
+):
+    """Affiche la liste des titres de la watchlist active (noms/secteurs préchargés)."""
+    if not tickers:
         st.sidebar.info(
             f"La watchlist « {active_name} » est vide. Ajoutez des tickers ci-dessus."
         )
+        return
 
+    names = wl_names or {}
+    if show_company_names and not names:
+        names, _ = get_ticker_metadata(tickers, need_names=True, need_sectors=False)
+
+    df_wl = pd.DataFrame({"Ticker": tickers})
+    df_wl = add_company_names(
+        df_wl,
+        names,
+        show_names=show_company_names,
+        sectors=wl_sectors,
+    )
+    st.sidebar.write(f"**{len(tickers)} titres** dans « {active_name} »")
+    st.sidebar.dataframe(df_wl, hide_index=True, use_container_width=True)
+
+    remove_tk = st.sidebar.selectbox(
+        "Retirer un ticker :",
+        ["-"] + tickers,
+        format_func=lambda t: "-"
+        if t == "-"
+        else ticker_label(t, names, show_company_names),
+        key="wl_remove_select",
+    )
+    if remove_tk != "-" and st.sidebar.button("Retirer", key="wl_remove_btn"):
+        data = load_watchlists_data()
+        ok, msg = remove_ticker_from_watchlist(data, active_name, remove_tk)
+        if ok:
+            st.success(msg)
+            st.rerun()
+        else:
+            st.error(msg)
+
+
+def render_watchlist_sidebar(
+    show_company_names,
+    index_tickers=None,
+    wl_names=None,
+    wl_sectors=None,
+):
+    """Gère les watchlists dans la sidebar. Retourne (liste_tickers, nom_watchlist_active)."""
+    tickers, active_name = render_watchlist_sidebar_controls(index_tickers=index_tickers)
+    render_watchlist_sidebar_table(
+        tickers,
+        active_name,
+        show_company_names,
+        wl_names=wl_names,
+        wl_sectors=wl_sectors,
+    )
     return tickers, active_name
 
 
 @st.fragment
-def render_watchlist_dashboard(prices, ticker_names, show_company_names, watchlist_name):
+def render_watchlist_dashboard(
+    prices,
+    ticker_names,
+    show_company_names,
+    watchlist_name,
+    ticker_sectors=None,
+):
     st.header(f"👁 Watchlist : {watchlist_name}")
     st.caption(
         "Suivi sans quantité ni PRU : cours actuel, fourchette 52 semaines, "
@@ -339,8 +455,16 @@ def render_watchlist_dashboard(prices, ticker_names, show_company_names, watchli
         st.info("Cliquez sur **Actualiser l'analyse** pour analyser les titres de la watchlist.")
         return
 
-    if show_company_names:
-        df = add_company_names(df, ticker_names, show_names=True)
+    if show_company_names or ticker_sectors:
+        df = add_company_names(
+            df,
+            ticker_names or {},
+            show_names=show_company_names,
+            sectors=ticker_sectors,
+        )
+    elif "Secteur" in df.columns:
+        df = df.copy()
+        df["Secteur"] = df["Secteur"].fillna("—")
 
     display_cols = [c for c in WATCHLIST_DISPLAY_COLUMNS if c in df.columns]
     view_df = df[display_cols].copy()

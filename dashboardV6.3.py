@@ -12,13 +12,12 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-st.set_page_config(layout="wide", page_title="Financial Dashboard V6.3")
-
 from analytics import (
     build_portfolio_value,
     build_portfolio_price_for_fft,
     build_mean_median_mode_pedagogy_chart,
     build_fft_spectral_acf_chart,
+    interpret_fft_acf_reading,
     build_fft_cyclic_chart,
     FFT_TREND_OPTIONS,
     FFT_TREND_LOG_LINEAR,
@@ -65,12 +64,15 @@ from analytics import (
     style_suggestions_technical,
     SUGGESTION_TECHNICAL_COLUMNS,
 )
+
+st.set_page_config(layout="wide", page_title="Financial Dashboard V6.3")
+
 from data_loader import (
     add_company_names,
     candlestick_trace,
     clear_market_cache,
     get_ohlc_for_ticker,
-    get_ticker_names,
+    get_ticker_metadata,
     label_index_with_names,
     load_ohlcv_in_batches,
     load_prices_in_batches,
@@ -144,6 +146,17 @@ BENCHMARKS = {
     "DAX 40": "^GDAXI",
 }
 
+VUES_AVEC_SECTEURS = frozenset(
+    {
+        "Ma watchlist",
+        "Synthèse & Plus-values",
+        "Optimisation (Markowitz)",
+        "Analyse technique (RSI / MACD)",
+        "Analyse de Fourier (FFT)",
+        "Suggestions d'actifs",
+    }
+)
+
 
 def is_usd_ticker(ticker):
     tk = str(ticker).upper()
@@ -156,6 +169,46 @@ def is_usd_ticker(ticker):
     if "." not in tk:
         return True
     return False
+
+
+def _render_fft_headline_metrics(result, peaks):
+    """Bandeau : cycle dominant, force du cycle et R² de la tendance retirée."""
+    c1, c2, c3, c4 = st.columns(4)
+    if peaks is not None and len(peaks):
+        c1.metric(
+            "Cycle principal",
+            peaks.iloc[0]["Période"],
+            help="Durée estimée du cycle le plus marqué (jours de bourse).",
+        )
+        c2.metric(
+            "Force du cycle",
+            f"{peaks.iloc[0]['Puissance relative']:.1%}",
+            help=(
+                "Part de l'énergie FFT du cycle dominant dans la bande analysée "
+                "(même valeur que « Puissance relative » du tableau)."
+            ),
+        )
+        if len(peaks) > 1:
+            c3.metric("2e cycle", peaks.iloc[1]["Période"])
+        else:
+            c3.metric("2e cycle", "—")
+    else:
+        c1.metric("Cycle principal", "—")
+        c2.metric("Force du cycle", "—")
+        c3.metric("2e cycle", "—")
+
+    r2 = result.get("trend_r2") if result else None
+    rmse = result.get("trend_rmse") if result else None
+    if r2 is not None and not (isinstance(r2, float) and np.isnan(r2)):
+        r2_help = (
+            "Qualité de la tendance retirée avant FFT, mesurée sur le prix réel (€). "
+            "1 = parfait · > 0,85 = bon · < 0,5 = tendance mal isolée."
+        )
+        if rmse is not None and not np.isnan(rmse):
+            r2_help += f" RMSE = {rmse:,.2f} (écart moyen prix vs tendance)."
+        c4.metric("R² tendance", f"{r2:.3f}", help=r2_help)
+    else:
+        c4.metric("R² tendance", "—", help="Non calculable sur cette série.")
 
 
 def _objective_weight_slider(label, low_hint, high_hint, default, key, tech_name=None):
@@ -256,37 +309,7 @@ if mode_selection == "💼 Mon Portefeuille Réel (CSV)":
             else:
                 st.error("Saisissez un Ticker valide.")
 
-    if portefeuille_dict:
-        st.sidebar.write("### Vos Positions :")
-        df_visu = pd.DataFrame.from_dict(portefeuille_dict, orient="index").reset_index()
-        df_visu.columns = ["Ticker", "Quantite", "PRU"]
-        sidebar_names = (
-            get_ticker_names(liste_tickers) if show_company_names and liste_tickers else {}
-        )
-        df_visu = add_company_names(df_visu, sidebar_names, show_names=show_company_names)
-        st.sidebar.dataframe(df_visu, hide_index=True)
-
-        ticker_to_delete = st.sidebar.selectbox(
-            "Supprimer une ligne :",
-            ["-"] + list(portefeuille_dict.keys()),
-            format_func=lambda t: "-"
-            if t == "-"
-            else ticker_label(t, sidebar_names, show_company_names),
-        )
-        if ticker_to_delete != "-":
-            if st.sidebar.button("❌ Confirmer la suppression"):
-                del portefeuille_dict[ticker_to_delete]
-                df_save = pd.DataFrame.from_dict(
-                    portefeuille_dict, orient="index"
-                ).reset_index()
-                if not df_save.empty:
-                    df_save.columns = ["Ticker", "Quantite", "PRU"]
-                    df_save.to_csv(FILE_PATH, index=False)
-                elif os.path.exists(FILE_PATH):
-                    os.remove(FILE_PATH)
-                st.sidebar.success(f"{ticker_to_delete} supprimé.")
-                st.rerun()
-    else:
+    if not portefeuille_dict:
         st.sidebar.info("Votre portefeuille CSV est vide. Ajoutez un ticker ci-dessus.")
 
 elif mode_selection == "👁 Mes Watchlists":
@@ -298,8 +321,8 @@ elif mode_selection == "👁 Mes Watchlists":
         except Exception:
             INDEX_TICKERS = {}
     if HAS_WATCHLISTS:
-        liste_tickers, active_watchlist_name = watchlists.render_watchlist_sidebar(
-            show_company_names, index_tickers=INDEX_TICKERS or None
+        liste_tickers, active_watchlist_name = watchlists.render_watchlist_sidebar_controls(
+            index_tickers=INDEX_TICKERS or None
         )
     else:
         st.sidebar.error("Le module watchlists.py n'a pas pu être chargé.")
@@ -326,22 +349,7 @@ else:
         liste_tickers = []
 
 # ==========================================
-# Noms d'entreprises (hors fragment — cache 24 h)
-# ==========================================
-ticker_names = {}
-if show_company_names and liste_tickers:
-    with st.spinner("Récupération des noms d'entreprises..."):
-        ticker_names = get_ticker_names(sorted(set(liste_tickers)))
-
-if liste_tickers and show_company_names and ticker_names:
-    with st.sidebar.expander("📋 Symboles Yahoo → noms d'entreprises", expanded=False):
-        ref_df = pd.DataFrame(
-            [{"Ticker": t, "Nom": ticker_names.get(t, t)} for t in liste_tickers]
-        )
-        st.dataframe(ref_df, hide_index=True, use_container_width=True)
-
-# ==========================================
-# Sélection de vue & rafraîchissement auto (sidebar stable)
+# Sélection de vue (avant métadonnées — secteurs chargés selon la vue)
 # ==========================================
 vue_options = [
     "Synthèse & Plus-values",
@@ -363,6 +371,88 @@ vue = st.sidebar.radio(
     vue_options,
 )
 
+# ==========================================
+# Noms d'entreprises et secteurs Yahoo (hors fragment — cache 24 h)
+# ==========================================
+ticker_names = {}
+ticker_sectors = {}
+need_ticker_sectors = bool(liste_tickers) and (
+    (mode_portfolio_actif and portefeuille_dict)
+    or vue in VUES_AVEC_SECTEURS
+)
+if liste_tickers:
+    uniq_tickers = sorted(set(liste_tickers))
+    need_names = show_company_names
+    if need_names or need_ticker_sectors:
+        spinner_label = "Récupération des métadonnées Yahoo..."
+        if need_names and not need_ticker_sectors:
+            spinner_label = "Récupération des noms d'entreprises..."
+        with st.spinner(spinner_label):
+            ticker_names, ticker_sectors = get_ticker_metadata(
+                uniq_tickers,
+                need_names=need_names,
+                need_sectors=need_ticker_sectors,
+            )
+
+if mode_portfolio_actif and portefeuille_dict:
+    st.sidebar.write("### Vos Positions :")
+    df_visu = pd.DataFrame.from_dict(portefeuille_dict, orient="index").reset_index()
+    df_visu.columns = ["Ticker", "Quantite", "PRU"]
+    df_visu = add_company_names(
+        df_visu,
+        ticker_names,
+        show_names=show_company_names,
+        sectors=ticker_sectors if need_ticker_sectors else None,
+    )
+    st.sidebar.dataframe(df_visu, hide_index=True)
+
+    ticker_to_delete = st.sidebar.selectbox(
+        "Supprimer une ligne :",
+        ["-"] + list(portefeuille_dict.keys()),
+        format_func=lambda t: "-"
+        if t == "-"
+        else ticker_label(t, ticker_names, show_company_names),
+    )
+    if ticker_to_delete != "-":
+        if st.sidebar.button("❌ Confirmer la suppression"):
+            del portefeuille_dict[ticker_to_delete]
+            df_save = pd.DataFrame.from_dict(
+                portefeuille_dict, orient="index"
+            ).reset_index()
+            if not df_save.empty:
+                df_save.columns = ["Ticker", "Quantite", "PRU"]
+                df_save.to_csv(FILE_PATH, index=False)
+            elif os.path.exists(FILE_PATH):
+                os.remove(FILE_PATH)
+            st.sidebar.success(f"{ticker_to_delete} supprimé.")
+            st.rerun()
+
+if mode_watchlist_actif and HAS_WATCHLISTS:
+    watchlists.render_watchlist_sidebar_table(
+        liste_tickers,
+        active_watchlist_name or "Watchlist",
+        show_company_names,
+        wl_names=ticker_names if show_company_names else {},
+        wl_sectors=ticker_sectors if need_ticker_sectors else None,
+    )
+
+if liste_tickers and (show_company_names and ticker_names or ticker_sectors):
+    with st.sidebar.expander("📋 Symboles Yahoo → noms d'entreprises", expanded=False):
+        ref_df = pd.DataFrame(
+            [
+                {
+                    "Ticker": t,
+                    "Nom": ticker_names.get(t, t) if show_company_names else t,
+                    "Secteur": ticker_sectors.get(t, "—"),
+                }
+                for t in liste_tickers
+            ]
+        )
+        st.dataframe(ref_df, hide_index=True, use_container_width=True)
+
+# ==========================================
+# Rafraîchissement auto (sidebar stable)
+# ==========================================
 auto_refresh_enabled = st.sidebar.checkbox(
     "🔄 Rafraîchissement auto des cours",
     value=False,
@@ -456,6 +546,7 @@ def render_live_dashboard():
                 ticker_names,
                 show_company_names,
                 active_watchlist_name or "Watchlist",
+                ticker_sectors=ticker_sectors,
             )
         else:
             st.error("Module watchlists indisponible.")
@@ -526,7 +617,7 @@ def render_live_dashboard():
                 if synthese_rows:
                     df_synthese = pd.DataFrame(synthese_rows)
                     df_synthese = add_company_names(
-                        df_synthese, ticker_names, show_names=show_company_names
+                        df_synthese, ticker_names, show_names=show_company_names, sectors=ticker_sectors
                     )
                     c1, c2, c3 = st.columns(3)
                     c1.metric("Valeur Totale (EUR)", f"{total_valeur_actuelle:,.2f} €")
@@ -772,7 +863,7 @@ sur la période sélectionnée.
                 last_prices = prices.iloc[-1].reset_index()
                 last_prices.columns = ["Ticker", "Dernier Cours (Devise d'origine)"]
                 last_prices = add_company_names(
-                    last_prices, ticker_names, show_names=show_company_names
+                    last_prices, ticker_names, show_names=show_company_names, sectors=ticker_sectors
                 )
                 st.dataframe(
                     last_prices.style.format(
@@ -1047,6 +1138,12 @@ sur la période sélectionnée.
                     arb_df = build_markowitz_arbitrage_table(
                         current_weights, weights, labels=label_map
                     )
+                    if ticker_sectors:
+                        arb_df.insert(
+                            2,
+                            "Secteur",
+                            arb_df["Ticker"].map(lambda t: ticker_sectors.get(t, "—")),
+                        )
                     if total_valeur_eur:
                         arb_df["Arbitrage (€)"] = arb_df["Écart (pts)"] * total_valeur_eur
                     st.dataframe(
@@ -1208,7 +1305,7 @@ sur la période sélectionnée.
                 st.session_state["technical_df"] = tech_df
                 st.session_state["technical_rsi_period"] = rsi_period
                 tech_display_df = add_company_names(
-                    tech_df, ticker_names, show_names=show_company_names
+                    tech_df, ticker_names, show_names=show_company_names, sectors=ticker_sectors
                 )
                 tech_display = rename_columns_for_display(tech_display_df, TECHNICAL_LABELS)
                 tech_format = format_map_for_labeled_columns(
@@ -1640,18 +1737,21 @@ sur la période sélectionnée.
 |-------|----------------|
 | **FFT** | *Fast Fourier Transform* — transforme l'historique des prix en **fréquences** (cycles). |
 | **Période (jours)** | Durée estimée d'un cycle complet (jours de bourse, ~5 j/semaine). |
-| **Puissance relative** | Importance du cycle dans le signal (plus c'est élevé, plus le motif est marqué). |
-| **Densité spectrale** | Courbe bleue : répartition de l'énergie par **période** (|FFT|² normalisée). |
-| **Autocorrélation (ACF)** | Courbe violette : similarité du signal avec lui-même décalé de *n* jours (Wiener-Khinchin). |
-| **Lignes orange (ACF)** | Décalages correspondant aux **périodes dominantes** détectées par FFT. |
-| **Prix dé-trendé** | On retire la tendance longue pour isoler les oscillations. |
-| **Tendance de fond** | Ligne grise en **€** : tendance retirée avant FFT ; type choisi à côté du graphique cyclique. |
-| **R² / RMSE** | Qualité de l'ajustement de la tendance au **prix réel** (plus R² proche de 1 = mieux). |
+| **Force du cycle** | **Même chose que « Puissance relative »** : part (en **%**) de l'énergie FFT portée par ce cycle dans la bande de périodes analysée (sliders min/max). Ex. **18 %** = motif modéré ; **> 25 %** = cycle assez visible ; **< 10 %** = faible, à prendre avec prudence. Affichée en métrique et dans le tableau des pics. |
+| **Puissance relative** | Synonyme technique de **force du cycle** (colonne du tableau des pics dominants). |
+| **Densité spectrale** | Courbe bleue (graphique du haut) : répartition de l'énergie par **période** (amplitude FFT² normalisée). Les **points rouges** marquent les pics retenus. |
+| **Autocorrélation (ACF)** | Courbe violette (graphique du bas) : à quel point le signal **ressemble à lui-même** décalé de *n* jours (théorème de Wiener-Khinchin — même information que le spectre, autre vue). |
+| **Comment lire l'ACF** | **Proche de +1** au décalage *n* → le motif tend à se **répéter** tous les *n* jours. **Proche de 0** → pas de régularité à ce décalage. **Négatif** → tendance à **alterner** (hausse puis baisse). **Entre les pointillés gris (±95 %)** → compatible avec le **bruit** (pas de cycle clair à ce lag). |
+| **Lignes orange (ACF)** | Décalages (en jours) correspondant aux **périodes dominantes** détectées par FFT : si l'ACF est aussi élevée à ces lags, le cycle FFT est **confirmé** ; si l'ACF reste proche de 0, le pic FFT peut être **accidentel**. |
+| **Prix dé-trendé** | On retire la tendance longue pour isoler les oscillations analysées par FFT. |
+| **Tendance de fond** | Ligne grise en **€** : tendance retirée avant FFT ; type choisi sous le graphique cyclique. |
+| **R² tendance** | Coefficient affiché en **métrique** (4ᵉ colonne) et sous le graphique cyclique : qualité de l'ajustement de la tendance au **prix réel**. **1,000** = parfait · **> 0,85** = bon · **< 0,5** = la tendance choisie ne décrit pas bien le cours (cycles moins fiables). |
+| **RMSE** | Écart-type moyen (€) entre prix réel et tendance — complète le R² (affiché sous le graphique cyclique). |
 | **Modèle FFT** | Tendance + cycles combinés, reprojetés en **prix** (cyan) ; prolongation **+30 %** en pointillé après la ligne « Fin historique ». |
 | **Prix** | Courbe **bleue** : historique réel du titre. |
 
 **Tendances disponibles :** **Log-linéaire** (croissance % constante) · **Linéaire €** (droite sur le prix)
-· **Hodrick-Prescott** (courbe lisse). Comparez via **R²** et **RMSE** affichés sous chaque analyse.
+· **Hodrick-Prescott** (courbe lisse). Comparez les **R²** affichés en changeant la tendance sous le graphique cyclique.
 
 **Extrapolation :** le modèle mathématique (tendance + harmoniques) est prolongé de **30 %** de la durée
 observée (jours de bourse). Zone pointillée = **scénario exploratoire**, pas une prévision garantie.
@@ -1687,10 +1787,14 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                 def _fft_trend_quality_caption(result):
                     if not result:
                         return
+                    r2 = result.get("trend_r2")
+                    rmse = result.get("trend_rmse")
+                    r2_txt = f"{r2:.3f}" if r2 is not None and not np.isnan(r2) else "—"
+                    rmse_txt = f"{rmse:,.2f}" if rmse is not None and not np.isnan(rmse) else "—"
                     st.caption(
-                        f"Ajustement : **{fft_trend_mode_label(result.get('trend_mode', trend_mode))}** · "
-                        f"R² = **{result['trend_r2']:.3f}** · "
-                        f"RMSE = **{result['trend_rmse']:,.2f}** (fidélité au prix historique)"
+                        f"Tendance : **{fft_trend_mode_label(result.get('trend_mode', trend_mode))}** · "
+                        f"R² = **{r2_txt}** · RMSE = **{rmse_txt}** € "
+                        "(qualité de la tendance retirée avant FFT — voir légende)"
                     )
 
                 portfolio_tickers_fft = [t for t in liste_tickers if t in prices.columns]
@@ -1738,15 +1842,7 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                         st.warning("FFT portefeuille indisponible sur la période.")
                     else:
                         port_peaks = port_fft["peaks"].drop(columns=["_freq_idx"], errors="ignore")
-                        pc1, pc2, pc3 = st.columns(3)
-                        if len(port_peaks):
-                            pc1.metric("Cycle principal", port_peaks.iloc[0]["Période"])
-                            pc2.metric(
-                                "Force du cycle",
-                                f"{port_peaks.iloc[0]['Puissance relative']:.1%}",
-                            )
-                            if len(port_peaks) > 1:
-                                pc3.metric("2e cycle", port_peaks.iloc[1]["Période"])
+                        _render_fft_headline_metrics(port_fft, port_peaks)
                         st.plotly_chart(
                             build_fft_spectral_acf_chart(
                                 port_fft,
@@ -1754,6 +1850,9 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                             ),
                             use_container_width=True,
                         )
+                        _acf_reading = interpret_fft_acf_reading(port_fft)
+                        if _acf_reading:
+                            st.info(_acf_reading)
                         port_peaks_disp = rename_columns_for_display(port_peaks, FFT_LABELS)
                         st.dataframe(
                             port_peaks_disp.style.format(
@@ -1806,7 +1905,7 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                     st.warning("Aucun ticker avec assez de données pour l'analyse FFT.")
                 else:
                     fft_summary = add_company_names(
-                        fft_summary, ticker_names, show_names=show_company_names
+                        fft_summary, ticker_names, show_names=show_company_names, sectors=ticker_sectors
                     )
                     fft_display = rename_columns_for_display(fft_summary, FFT_LABELS)
                     fmt_cols = format_map_for_labeled_columns(
@@ -1845,6 +1944,7 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                             fft_ticker, ticker_names, show_company_names
                         )
                         peaks = fft_result["peaks"].drop(columns=["_freq_idx"], errors="ignore")
+                        _render_fft_headline_metrics(fft_result, peaks)
                         st.plotly_chart(
                             build_fft_spectral_acf_chart(
                                 fft_result,
@@ -1852,6 +1952,9 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                             ),
                             use_container_width=True,
                         )
+                        _acf_reading = interpret_fft_acf_reading(fft_result)
+                        if _acf_reading:
+                            st.info(_acf_reading)
                         peaks_disp = rename_columns_for_display(peaks, FFT_LABELS)
                         st.dataframe(
                             peaks_disp.style.format(
@@ -1882,7 +1985,12 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
 
         elif vue == "Synthèse bon marché / cher":
             if HAS_ASSET_SUMMARY:
-                asset_summary.render_asset_summary_dashboard(prices)
+                asset_summary.render_asset_summary_dashboard(
+                    prices,
+                    ticker_names=ticker_names,
+                    show_company_names=show_company_names,
+                    ticker_sectors=ticker_sectors,
+                )
             else:
                 st.error("Le module 'asset_summary.py' n'a pas pu être chargé.")
 
@@ -2831,10 +2939,26 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                             pass
                         else:
                             display_df = suggestions_view.head(top_n).copy()
-                            if show_company_names and "Ticker" in display_df.columns:
-                                sugg_names = get_ticker_names(display_df["Ticker"].tolist())
+                            if "Ticker" in display_df.columns and (
+                                show_company_names or need_ticker_sectors
+                            ):
+                                sugg_names, sugg_sectors = get_ticker_metadata(
+                                    display_df["Ticker"].tolist(),
+                                    need_names=show_company_names,
+                                    need_sectors=need_ticker_sectors,
+                                )
                                 display_df = add_company_names(
-                                    display_df, sugg_names, show_names=True
+                                    display_df,
+                                    sugg_names,
+                                    show_names=show_company_names,
+                                    sectors=sugg_sectors if need_ticker_sectors else None,
+                                )
+                            elif "Ticker" in display_df.columns:
+                                display_df = add_company_names(
+                                    display_df,
+                                    {},
+                                    show_names=False,
+                                    sectors=None,
                                 )
                             display_view = rename_columns_for_display(
                                 display_df, SUGGESTIONS_LABELS
@@ -2909,7 +3033,11 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                             st.markdown("### Visualisation des compromis")
                             plot_df = suggestions_view.head(min(50, len(suggestions_view))).copy()
                             if show_company_names and "Ticker" in plot_df.columns:
-                                plot_names = get_ticker_names(plot_df["Ticker"].tolist())
+                                plot_names, _ = get_ticker_metadata(
+                                    plot_df["Ticker"].tolist(),
+                                    need_names=True,
+                                    need_sectors=False,
+                                )
                                 plot_df["Libellé"] = plot_df["Ticker"].map(
                                     lambda t: ticker_label(t, plot_names, True)
                                 )

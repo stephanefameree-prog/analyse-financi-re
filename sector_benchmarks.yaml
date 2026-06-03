@@ -1,0 +1,221 @@
+# Multiples cibles pour la juste valeur (piliers PER / P/B / P/S / dividende).
+# Généré / mis à jour par : python update_sector_benchmarks.py
+# Sources : Damodaran NYU Stern — pedata, pbvdata, psdata, countrystats
+# https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datacurrent.html
+#
+# Profils « tech » et « minières » : multiples US conservés (calibrage ma vue).
+# Autres profils : médianes agrégées Damodaran (US, sociétés profitables).
+# Facteurs pays : médianes countrystats vs États-Unis.
+
+meta:
+  version: 2
+  updated: 2026-06
+  baseline_country: United States
+  generator: update_sector_benchmarks.py
+baseline_market:
+  per: 22.61
+  pb: 2.188
+  ps: 2.038
+  source: Damodaran countrystats — median Trailing PE / PBV / PS, 2026-06
+countries:
+  default:
+    per: 1.0
+    pb: 1.0
+    ps: 1.0
+    div_yield: 1.0
+  United States:
+    per: 1.0
+    pb: 1.0
+    ps: 1.0
+    div_yield: 1.0
+  France:
+    per: 0.727
+    pb: 0.541
+    ps: 0.457
+    div_yield: 1.15
+    source: Trailing PE 16.44, PB 1.18, PS 0.93 vs US 22.61 / 2.188 / 2.038
+  Germany:
+    per: 0.879
+    pb: 0.651
+    ps: 0.486
+    div_yield: 1.08
+    source: Trailing PE 19.88, PB 1.43, PS 0.99 vs US 22.61 / 2.188 / 2.038
+  United Kingdom:
+    per: 0.799
+    pb: 0.743
+    ps: 0.764
+    div_yield: 1.1
+    source: Trailing PE 18.07, PB 1.63, PS 1.56 vs US 22.61 / 2.188 / 2.038
+  Netherlands:
+    per: 0.757
+    pb: 0.814
+    ps: 0.866
+    div_yield: 1.08
+    source: Trailing PE 17.12, PB 1.78, PS 1.76 vs US 22.61 / 2.188 / 2.038
+  Belgium:
+    per: 0.739
+    pb: 0.472
+    ps: 0.97
+    div_yield: 1.12
+    source: Trailing PE 16.70, PB 1.03, PS 1.98 vs US 22.61 / 2.188 / 2.038
+  Switzerland:
+    per: 1.026
+    pb: 0.936
+    ps: 0.828
+    div_yield: 0.95
+    source: Trailing PE 23.20, PB 2.05, PS 1.69 vs US 22.61 / 2.188 / 2.038
+  Italy:
+    per: 0.788
+    pb: 0.723
+    ps: 0.462
+    div_yield: 1.1
+    source: Trailing PE 17.83, PB 1.58, PS 0.94 vs US 22.61 / 2.188 / 2.038
+  Spain:
+    per: 0.753
+    pb: 0.855
+    ps: 0.824
+    div_yield: 1.08
+    source: Trailing PE 17.04, PB 1.87, PS 1.68 vs US 22.61 / 2.188 / 2.038
+  Canada:
+    per: 0.75
+    pb: 1.149
+    ps: 1.261
+    div_yield: 1.05
+    source: Trailing PE 16.96, PB 2.51, PS 2.57 vs US 22.61 / 2.188 / 2.038
+  Australia:
+    per: 0.954
+    pb: 1.076
+    ps: 2.683
+    div_yield: 1.05
+    source: Trailing PE 21.57, PB 2.35, PS 5.47 vs US 22.61 / 2.188 / 2.038
+  Japan:
+    per: 0.614
+    pb: 0.54
+    ps: 0.37
+    div_yield: 1.05
+    source: Trailing PE 13.89, PB 1.18, PS 0.75 vs US 22.61 / 2.188 / 2.038
+  Hong Kong:
+    per: 0.488
+    pb: 0.314
+    ps: 0.372
+    div_yield: 1.2
+    source: Trailing PE 11.04, PB 0.69, PS 0.76 vs US 22.61 / 2.188 / 2.038
+  India:
+    per: 1.097
+    pb: 0.983
+    ps: 0.839
+    div_yield: 0.9
+    source: Trailing PE 24.81, PB 2.15, PS 1.71 vs US 22.61 / 2.188 / 2.038
+  Brazil:
+    per: 0.448
+    pb: 0.456
+    ps: 0.441
+    div_yield: 1.25
+    source: Trailing PE 10.13, PB 1.00, PS 0.90 vs US 22.61 / 2.188 / 2.038
+  Europe:
+    per: 0.802
+    pb: 0.645
+    ps: 0.569
+    div_yield: 1.11
+    source: Moyenne France / Allemagne / Royaume-Uni — repli suffixes EU
+ticker_suffix:
+  PA: France
+  DE: Germany
+  L: United Kingdom
+  AS: Netherlands
+  BR: Belgium
+  SW: Switzerland
+  MI: Italy
+  MC: Spain
+  CO: Europe
+  HE: Europe
+  ST: Europe
+  OL: Europe
+  VI: Europe
+  IR: Europe
+  TO: Canada
+  V: Canada
+  AX: Australia
+  HK: Hong Kong
+  T: Japan
+  KS: Korea
+  SA: Brazil
+  MX: Mexico
+  NS: India
+  BO: India
+profiles:
+  alimentation:
+    source_industry: Food Processing, Beverage (Soft), Beverage (Alcoholic) (US Damodaran
+      agg. PE profitable firms)
+    multiples:
+      per: 18.95
+      pb: 3.09
+      ps: 1.82
+      div_yield: 0.03
+  biotech:
+    source_industry: Drugs (Biotechnology) (US Damodaran agg. PE profitable firms)
+    multiples:
+      per: 32.05
+      pb: 8.22
+      ps: 7.31
+      div_yield: 0.0
+  consommation:
+    source_industry: Retail (General), Apparel (US Damodaran agg. PE profitable firms)
+    multiples:
+      per: 30.61
+      pb: 5.71
+      ps: 1.68
+      div_yield: 0.015
+  défense:
+    source_industry: Aerospace/Defense (US Damodaran agg. PE profitable firms)
+    multiples:
+      per: 35.27
+      pb: 7.88
+      ps: 3.17
+      div_yield: 0.015
+  finance:
+    source_industry: Banks (Regional), Insurance (General) (US Damodaran agg. PE profitable
+      firms)
+    multiples:
+      per: 19.23
+      pb: 2.18
+      ps: 3.61
+      div_yield: 0.035
+  industrie:
+    source_industry: Business & Consumer Services, Steel, Building Materials (US Damodaran
+      agg. PE profitable firms)
+    multiples:
+      per: 22.37
+      pb: 4.02
+      ps: 1.77
+      div_yield: 0.025
+  minières:
+    source_industry: Precious Metals / Mining — base calibrée ma vue minières
+    multiples:
+      per: 15.0
+      pb: 1.35
+      ps: 2.0
+      div_yield: 0.035
+  pharma:
+    source_industry: Drugs (Pharmaceutical) (US Damodaran agg. PE profitable firms)
+    multiples:
+      per: 24.95
+      pb: 6.64
+      ps: 5.63
+      div_yield: 0.02
+  tech:
+    source_industry: Software + Computer Services (US Damodaran) — base calibrée ma
+      vue tech
+    multiples:
+      per: 28.0
+      pb: 5.0
+      ps: 8.0
+      div_yield: 0.01
+  énergie:
+    source_industry: Oil/Gas (Integrated), Utility (General) (US Damodaran agg. PE
+      profitable firms)
+    multiples:
+      per: 19.68
+      pb: 1.75
+      ps: 2.17
+      div_yield: 0.045

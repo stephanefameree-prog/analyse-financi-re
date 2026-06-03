@@ -3,6 +3,7 @@ import pandas as pd
 import streamlit as st
 
 from analytics import compute_technical_indicators
+from data_loader import add_company_names
 from display_units import (
     ASSET_SUMMARY_FORMAT,
     ASSET_SUMMARY_LABELS,
@@ -202,6 +203,7 @@ def build_asset_summary_table(prices, rsi_period=14):
         rows.append(
             {
                 "Ticker": ticker,
+                "Secteur": funda_row.get("Secteur Yahoo"),
                 "Prix": lp,
                 "Min 52 sem.": funda_row.get("Min 52 sem."),
                 "Max 52 sem.": funda_row.get("Max 52 sem."),
@@ -232,7 +234,12 @@ def cached_build_asset_summary_table(prices_sig, rsi_period, prices):
 
 
 @st.fragment
-def render_asset_summary_dashboard(prices):
+def render_asset_summary_dashboard(
+    prices,
+    ticker_names=None,
+    show_company_names=True,
+    ticker_sectors=None,
+):
     st.subheader("Synthèse par actif : bon marché ou cher ?")
     st.caption(
         "Combine valorisation fondamentale (PER, upside analystes, dette/FCF…) "
@@ -255,15 +262,27 @@ def render_asset_summary_dashboard(prices):
         st.info("Cliquez sur **Générer la synthèse** pour analyser vos actifs.")
         return
 
-    cheap = (df["Synthèse globale"].isin(["Bon marché", "Plutôt bon marché"])).sum()
-    rich = (df["Synthèse globale"].isin(["Cher", "Plutôt cher"])).sum()
-    neutral = len(df) - cheap - rich
+    if ticker_sectors is not None or (show_company_names and ticker_names):
+        df_display_src = add_company_names(
+            df,
+            ticker_names or {},
+            show_names=show_company_names,
+            sectors=ticker_sectors,
+        )
+    else:
+        df_display_src = df.copy()
+        if "Secteur" in df_display_src.columns:
+            df_display_src["Secteur"] = df_display_src["Secteur"].fillna("—")
+
+    cheap = (df_display_src["Synthèse globale"].isin(["Bon marché", "Plutôt bon marché"])).sum()
+    rich = (df_display_src["Synthèse globale"].isin(["Cher", "Plutôt cher"])).sum()
+    neutral = len(df_display_src) - cheap - rich
     c1, c2, c3 = st.columns(3)
     c1.metric("Bon marché / plutôt bon marché", int(cheap))
     c2.metric("Neutre", int(neutral))
     c3.metric("Cher / plutôt cher", int(rich))
 
-    df_display = rename_columns_for_display(df, ASSET_SUMMARY_LABELS)
+    df_display = rename_columns_for_display(df_display_src, ASSET_SUMMARY_LABELS)
     summary_format = format_map_for_labeled_columns(
         df_display, ASSET_SUMMARY_LABELS, ASSET_SUMMARY_FORMAT
     )
