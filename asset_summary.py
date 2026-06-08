@@ -12,7 +12,7 @@ from display_units import (
     rename_columns_for_display,
 )
 from fundamentals import (
-    compute_market_indicators,
+    _refresh_market_fields_from_prices,
     cached_fetch_fundamentals_for_ticker,
 )
 
@@ -38,10 +38,12 @@ def _label_from_score(score):
 
 
 def _price_stats_from_series(price_series, last_price, ticker=None):
-    """Compatibilité watchlist / synthèse — délègue aux indicateurs marché."""
-    market = compute_market_indicators(ticker or "", price_series, last_price)
+    """Stats 52 sem. depuis OHLCV — sans second appel Yahoo complet."""
+    row = _refresh_market_fields_from_prices(
+        {}, price_series, last_price=last_price, ticker=ticker
+    )
     return {
-        k: market[k]
+        k: row[k]
         for k in (
             "Min 52 sem.",
             "Max 52 sem.",
@@ -50,7 +52,7 @@ def _price_stats_from_series(price_series, last_price, ticker=None):
             "Sommet 52 sem.",
             "Creux 52 sem.",
         )
-        if market.get(k) is not None
+        if row.get(k) is not None
     }
 
 
@@ -131,6 +133,12 @@ def score_technical_valuation(row, last_price=None):
         votes.append(-0.5)
     elif signal_mm == "Haussière":
         votes.append(0.5)
+
+    st_sig = str(row.get("Signal SuperTrend", ""))
+    if st_sig == "Haussier":
+        votes.append(0.5)
+    elif st_sig == "Baissier":
+        votes.append(-0.5)
 
     score = _score_from_votes([v for v in votes if v != 0])
     return score, _label_from_score(score), len([v for v in votes if v != 0])
@@ -213,8 +221,11 @@ def build_asset_summary_table(prices, rsi_period=14):
                 "Score global": combined_score,
                 "Commentaire": build_synthesis_comment(funda_label, tech_label),
                 "PER": funda_row.get("PER"),
+                "Rendement dividende": funda_row.get("Rendement dividende"),
+                "Dividende / action": funda_row.get("Dividende / action"),
                 "Upside vs objectif": funda_row.get("Upside vs objectif"),
                 "Position 52 sem.": funda_row.get("Position 52 sem."),
+                "Variation 1 an": funda_row.get("Variation 1 an"),
                 "RSI": tech_row.get("RSI"),
                 "Bollinger %B": tech_row.get("Bollinger %B"),
                 "Indicateurs fonda utilisés": funda_votes,

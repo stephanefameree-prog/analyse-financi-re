@@ -229,3 +229,16 @@ anchors:
     analyst_upside: 0.759
     comparable_fv: 236.96
     dcf_fv: 261.58
+
+  - ticker: MRVL
+    full_ticker: NASDAQGS:MRVL
+    name: Marvell Technology
+    as_of: "2026-06-03"
+    price: 305.64
+    fair_value: 158.76
+    label: Surévaluée
+    per: 27.1
+    analyst_upside: -0.236
+    comparable_fv: 161.53
+    dcf_fv: 150.10
+    ddm_fv: 194.13

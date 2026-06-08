@@ -619,7 +619,9 @@
     "KXS.TO",
     "TOI.TO",
     "CTS.TO",
-    "DCBO.TO"
+    "DCBO.TO",
+    "T.TO",
+    "TU"
   ],
   "NORTH_AMERICA_TECH": [
     "AAPL",
@@ -1847,7 +1849,21 @@
     "BNP.PA",
     "ENGI.PA",
     "MBG.DE",
-    "EPD"
+    "EPD",
+    "ASC",
+    "DEC",
+    "GSL",
+    "INSW",
+    "MRP",
+    "OMF",
+    "OWL",
+    "PLTK",
+    "QFIN",
+    "RLI",
+    "T.TO",
+    "TU",
+    "WEN",
+    "WLKP"
   ],
   "EU_DIVIDEND_STABLE": [
     "AI.PA",
@@ -3156,15 +3172,18 @@
     "XPL"
   ],
   "USA_WATCHLIST_ENERGY": [
+    "ASC",
     "CVX",
     "DEC",
     "DVN",
     "FSLR",
+    "GSL",
     "INSW",
     "NNE",
     "RUN",
     "TEN",
     "TS",
+    "WLKP",
     "XOM"
   ],
   "USA_WATCHLIST_FINANCE": [
@@ -3177,7 +3196,11 @@
     "FINV",
     "GS",
     "MCO",
+    "OMF",
+    "ORI",
+    "OWL",
     "QFIN",
+    "RLI",
     "TFSL",
     "TREE",
     "VRTS"
@@ -3190,12 +3213,14 @@
     "LPX",
     "LUMN",
     "MNST",
+    "PLTK",
     "PRG",
     "SNDL",
     "STZ",
     "T",
     "TGNA",
     "TGT",
+    "WEN",
     "WMT",
     "FDX"
   ],

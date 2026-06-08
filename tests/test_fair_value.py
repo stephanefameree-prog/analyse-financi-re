@@ -470,7 +470,7 @@ def test_investing_anchors_yaml_loads_bnp():
     assert any(a.get("ticker") == "SOI.PA" for a in anchors)
     assert any(a.get("ticker") == "SU.PA" for a in anchors)
     frame = fv.investing_anchors_to_training_frame(anchors)
-    assert len(frame) == 14
+    assert len(frame) == 15
     bnp = frame[frame[fv.COL_NAME].astype(str).str.contains("BNP", na=False)]
     assert float(bnp["fair_value"].iloc[0]) == pytest.approx(95.18)
 
@@ -597,6 +597,26 @@ def test_eden_anchor_in_training_frame():
     assert eden["label"] == "Sous-évaluée"
     assert eden["comparable_fv"] == pytest.approx(31.87)
     assert eden["dcf_fv"] == pytest.approx(44.57)
+
+
+def test_mrvl_anchor_in_training_frame():
+    anchors = fv.load_investing_anchors(ROOT / "investing_anchors.yaml")
+    mrvl = next(a for a in anchors if a.get("ticker") == "MRVL")
+    assert mrvl["fair_value"] == pytest.approx(158.76)
+    assert mrvl["price"] == pytest.approx(305.64)
+    assert mrvl["label"] == "Surévaluée"
+    assert mrvl["comparable_fv"] == pytest.approx(161.53)
+    assert mrvl["dcf_fv"] == pytest.approx(150.10)
+    assert mrvl["ddm_fv"] == pytest.approx(194.13)
+
+
+def test_mrvl_anchor_submodel_enrichment():
+    idx = fv.build_investing_anchors_index(ROOT / "investing_anchors.yaml")
+    assert "MRVL" in idx
+    mrvl = idx["MRVL"]
+    assert mrvl[fv.COL_FV_COMP_UP] == pytest.approx(161.53 / 305.64 - 1.0, rel=1e-3)
+    assert mrvl[fv.COL_FV_DCF_UP] == pytest.approx(150.10 / 305.64 - 1.0, rel=1e-3)
+    assert mrvl[fv.COL_FV_DDM_UP] == pytest.approx(194.13 / 305.64 - 1.0, rel=1e-3)
 
 
 def test_nyxh_anchor_in_training_frame():

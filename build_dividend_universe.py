@@ -30,7 +30,7 @@ def main():
     parser.add_argument(
         "--save-every",
         type=int,
-        default=20,
+        default=50,
         help="Sauvegarde sur disque tous les N tickers",
     )
     args = parser.parse_args()
@@ -56,6 +56,8 @@ def main():
         limit=args.limit,
         sleep_seconds=args.sleep,
         save_every=args.save_every,
+        lite=True,
+        timeout_seconds=50,
     )
     elapsed = time.time() - started
     meta = universe.get("meta", {})

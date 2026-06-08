@@ -12,9 +12,11 @@ import streamlit as st
 import yfinance as yf
 
 MARKET_CACHE_DIR = "market_cache"
+TICKER_CACHE_SUBDIR = "tickers"
 INCREMENTAL_LOOKBACK_DAYS = 10
 FULL_CACHE_MAX_AGE_HOURS = 24
 DEFAULT_BATCH_SIZE = 100
+OHLCV_FRAME_KEYS = ("prices", "volumes", "highs", "lows", "opens", "ohlc_closes")
 
 
 def filter_valid_tickers(tickers, start_date):
@@ -63,19 +65,226 @@ def _save_market_cache(signature, bundle):
     path = _market_cache_path(signature)
     bundle = dict(bundle)
     bundle["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    with open(path, "wb") as f:
+    tmp = path.with_suffix(".pkl.tmp")
+    with open(tmp, "wb") as f:
         pickle.dump(bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(path)
 
 
-def clear_market_cache(signature=None):
+def _ticker_cache_dir():
+    path = _market_cache_dir() / TICKER_CACHE_SUBDIR
+    path.mkdir(exist_ok=True)
+    return path
+
+
+def _ticker_cache_path(ticker, start):
+    start_str = pd.to_datetime(start).strftime("%Y-%m-%d")
+    digest = hashlib.md5(f"{str(ticker).strip()}|{start_str}".encode("utf-8")).hexdigest()[:16]
+    return _ticker_cache_dir() / f"{digest}.pkl"
+
+
+def _load_ticker_cache(ticker, start):
+    path = _ticker_cache_path(ticker, start)
+    if not path.is_file():
+        return None
+    try:
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
+        if isinstance(payload, dict) and "prices" in payload:
+            return payload
+    except Exception:
+        pass
+    return None
+
+
+def _save_ticker_cache(ticker, start, payload):
+    path = _ticker_cache_path(ticker, start)
+    payload = dict(payload)
+    payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    tmp = path.with_suffix(".pkl.tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(path)
+
+
+def _merge_series(old_s, new_s):
+    if old_s is None or (isinstance(old_s, pd.Series) and old_s.dropna().empty):
+        return new_s.copy() if new_s is not None else pd.Series(dtype=float)
+    if new_s is None or (isinstance(new_s, pd.Series) and new_s.dropna().empty):
+        return old_s.copy()
+    merged = pd.concat([old_s, new_s]).sort_index()
+    merged = merged[~merged.index.duplicated(keep="last")]
+    return merged
+
+
+def _extract_ticker_payload(bundle, ticker):
+    payload = {}
+    for key in OHLCV_FRAME_KEYS:
+        df = bundle.get(key, pd.DataFrame())
+        if isinstance(df, pd.DataFrame) and ticker in df.columns:
+            payload[key] = df[ticker].copy()
+        else:
+            payload[key] = pd.Series(dtype=float, name=ticker)
+    return payload
+
+
+def _merge_ticker_payload(base, recent):
+    if not base:
+        return recent
+    if not recent:
+        return base
+    out = {}
+    for key in OHLCV_FRAME_KEYS:
+        out[key] = _merge_series(base.get(key), recent.get(key))
+    out["updated_at"] = recent.get("updated_at") or base.get("updated_at")
+    return out
+
+
+def _concat_frame_parts(frames):
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, axis=1)
+    out = out.loc[:, ~out.columns.duplicated()]
+    return out.ffill().bfill()
+
+
+def _assemble_bundle_from_ticker_caches(tickers, start):
+    frame_parts = {key: [] for key in OHLCV_FRAME_KEYS}
+    latest_update = None
+    for ticker in tickers:
+        tc = _load_ticker_cache(ticker, start)
+        if not tc:
+            continue
+        updated_at = tc.get("updated_at")
+        if updated_at and (latest_update is None or updated_at > latest_update):
+            latest_update = updated_at
+        for key in OHLCV_FRAME_KEYS:
+            series = tc.get(key)
+            if series is not None and not pd.Series(series).dropna().empty:
+                frame_parts[key].append(pd.DataFrame({ticker: series}))
+    bundle = {key: _concat_frame_parts(parts) for key, parts in frame_parts.items()}
+    bundle["updated_at"] = latest_update or datetime.now().isoformat(timespec="seconds")
+    return bundle
+
+
+def _tickers_missing_from_bundle(bundle, tickers):
+    prices = bundle.get("prices", pd.DataFrame())
+    missing = []
+    for ticker in tickers:
+        if ticker not in prices.columns:
+            missing.append(ticker)
+            continue
+        if prices[ticker].dropna().empty:
+            missing.append(ticker)
+    return missing
+
+
+def _tuple_to_bundle(t_tuple):
+    return {
+        "prices": t_tuple[0],
+        "volumes": t_tuple[1],
+        "highs": t_tuple[2],
+        "lows": t_tuple[3],
+        "opens": t_tuple[4],
+        "ohlc_closes": t_tuple[5],
+    }
+
+
+def _persist_ticker_caches_from_bundle(bundle, tickers, start):
+    prices = bundle.get("prices", pd.DataFrame())
+    for ticker in tickers:
+        if ticker not in prices.columns:
+            continue
+        _save_ticker_cache(ticker, start, _extract_ticker_payload(bundle, ticker))
+
+
+def _maybe_migrate_legacy_cache(tickers, start):
+    """Découpe un cache legacy (signature portefeuille) en caches par ticker."""
+    missing = [t for t in tickers if not _load_ticker_cache(t, start)]
+    if not missing:
+        return
+    legacy = _load_market_cache(_tickers_signature(tickers, start))
+    if not legacy:
+        return
+    for ticker in missing:
+        if ticker in legacy.get("prices", pd.DataFrame()).columns:
+            payload = _extract_ticker_payload(legacy, ticker)
+            payload["updated_at"] = legacy.get("updated_at")
+            _save_ticker_cache(ticker, start, payload)
+
+
+def _apply_yahoo_updates(tickers, start, start_dt, batch_size, mode):
+    """
+    mode: 'full' | 'incremental'
+    Met à jour les caches par ticker et retourne le bundle assemblé.
+    """
+    tickers = [str(t).strip() for t in tickers if str(t).strip()]
+    if not tickers:
+        return _assemble_bundle_from_ticker_caches([], start)
+
+    caches = {t: _load_ticker_cache(t, start) for t in tickers}
+
+    if mode == "incremental":
+        to_full = [t for t in tickers if not caches.get(t)]
+        to_inc = [t for t in tickers if caches.get(t)]
+    else:
+        to_full = list(tickers)
+        to_inc = []
+
+    if to_full:
+        full_tuple = _fetch_ohlcv_from_yahoo(
+            to_full, start_dt, end=None, batch_size=batch_size
+        )
+        full_bundle = _tuple_to_bundle(full_tuple)
+        for ticker in to_full:
+            if ticker in full_bundle.get("prices", pd.DataFrame()).columns:
+                existing = caches.get(ticker)
+                if existing and mode == "incremental":
+                    merged = _merge_ticker_payload(
+                        existing, _extract_ticker_payload(full_bundle, ticker)
+                    )
+                    _save_ticker_cache(ticker, start, merged)
+                else:
+                    _save_ticker_cache(
+                        ticker, start, _extract_ticker_payload(full_bundle, ticker)
+                    )
+
+    if to_inc:
+        inc_start = max(
+            start_dt, pd.Timestamp.now() - pd.Timedelta(days=INCREMENTAL_LOOKBACK_DAYS)
+        )
+        recent_tuple = _fetch_ohlcv_from_yahoo(
+            to_inc, inc_start, end=None, batch_size=batch_size
+        )
+        recent_bundle = _tuple_to_bundle(recent_tuple)
+        for ticker in to_inc:
+            if ticker not in recent_bundle.get("prices", pd.DataFrame()).columns:
+                continue
+            merged = _merge_ticker_payload(
+                caches[ticker], _extract_ticker_payload(recent_bundle, ticker)
+            )
+            _save_ticker_cache(ticker, start, merged)
+
+    return _assemble_bundle_from_ticker_caches(tickers, start)
+
+
+def clear_market_cache(signature=None, tickers=None, start=None):
+    """Vide le cache cours. Avec signature, supprime aussi les fichiers par ticker."""
     cache_dir = _market_cache_dir()
     if signature is None:
         for file in cache_dir.glob("ohlcv_*.pkl"):
             file.unlink(missing_ok=True)
+        ticker_dir = cache_dir / TICKER_CACHE_SUBDIR
+        if ticker_dir.is_dir():
+            for file in ticker_dir.glob("*.pkl"):
+                file.unlink(missing_ok=True)
         return
     path = _market_cache_path(signature)
-    if path.is_file():
-        path.unlink()
+    path.unlink(missing_ok=True)
+    if tickers and start is not None:
+        for ticker in tickers:
+            tp = _ticker_cache_path(ticker, start)
+            tp.unlink(missing_ok=True)
 
 
 def _merge_market_frames(df_old, df_new):
@@ -256,65 +465,56 @@ def _fetch_ohlcv_from_yahoo(tickers, start, end=None, batch_size=DEFAULT_BATCH_S
 
 def load_ohlcv_smart(tickers, start, batch_size=DEFAULT_BATCH_SIZE, refresh="auto"):
     """
-    Charge OHLCV avec cache disque et mise à jour incrémentale.
+    Charge OHLCV avec cache disque par ticker et mise à jour incrémentale.
 
     refresh:
-      - full         : retélécharge tout l'historique
+      - full         : retélécharge tout l'historique (par ticker)
       - incremental  : met à jour les ~10 derniers jours seulement
       - cache_only   : lit le disque sans appeler Yahoo
-      - auto         : cache disque frais sinon full, puis incremental si cache existe
+      - auto         : cache frais par ticker sinon fetch ciblé (nouveaux tickers seulement)
     """
     tickers = [str(t).strip() for t in tickers if str(t).strip()]
     if not tickers:
         empty = pd.DataFrame()
         return empty, empty, empty, empty, empty, empty
 
-    signature = _tickers_signature(tickers, start)
-    cached = _load_market_cache(signature)
     start_dt = pd.to_datetime(start)
+    _maybe_migrate_legacy_cache(tickers, start)
 
     if refresh == "cache_only":
-        return _bundle_to_tuple(cached)
+        bundle = _assemble_bundle_from_ticker_caches(tickers, start)
+        if not _tickers_missing_from_bundle(bundle, tickers):
+            return _bundle_to_tuple(bundle)
+        legacy = _load_market_cache(_tickers_signature(tickers, start))
+        if legacy:
+            return _bundle_to_tuple(legacy)
+        return _bundle_to_tuple(bundle)
 
     if refresh == "auto":
-        if cached and _cache_is_fresh(cached):
-            return _bundle_to_tuple(cached)
-        refresh = "incremental" if cached else "full"
+        caches = {t: _load_ticker_cache(t, start) for t in tickers}
+        if all(caches[t] and _cache_is_fresh(caches[t]) for t in tickers):
+            bundle = _assemble_bundle_from_ticker_caches(tickers, start)
+            return _bundle_to_tuple(bundle)
+        to_full = [t for t in tickers if not caches.get(t)]
+        to_inc = [
+            t for t in tickers if caches.get(t) and not _cache_is_fresh(caches[t])
+        ]
+        if to_full:
+            _apply_yahoo_updates(to_full, start, start_dt, batch_size, mode="full")
+        if to_inc:
+            _apply_yahoo_updates(to_inc, start, start_dt, batch_size, mode="incremental")
+        bundle = _assemble_bundle_from_ticker_caches(tickers, start)
+        return _bundle_to_tuple(bundle)
 
-    if refresh == "incremental" and cached:
-        inc_start = max(start_dt, pd.Timestamp.now() - pd.Timedelta(days=INCREMENTAL_LOOKBACK_DAYS))
-        recent_tuple = _fetch_ohlcv_from_yahoo(
-            tickers,
-            inc_start,
-            end=None,
-            batch_size=batch_size,
+    if refresh == "incremental":
+        bundle = _apply_yahoo_updates(
+            tickers, start, start_dt, batch_size, mode="incremental"
         )
-        recent = {
-            "prices": recent_tuple[0],
-            "volumes": recent_tuple[1],
-            "highs": recent_tuple[2],
-            "lows": recent_tuple[3],
-            "opens": recent_tuple[4],
-            "ohlc_closes": recent_tuple[5],
-        }
-        merged = _merge_market_bundle(cached, recent)
-        _save_market_cache(signature, merged)
-        return _bundle_to_tuple(merged)
+        return _bundle_to_tuple(bundle)
 
-    if refresh == "incremental" and not cached:
-        refresh = "full"
-
-    full_tuple = _fetch_ohlcv_from_yahoo(tickers, start_dt, end=None, batch_size=batch_size)
-    bundle = {
-        "prices": full_tuple[0],
-        "volumes": full_tuple[1],
-        "highs": full_tuple[2],
-        "lows": full_tuple[3],
-        "opens": full_tuple[4],
-        "ohlc_closes": full_tuple[5],
-    }
-    if cached:
-        bundle = _merge_market_bundle(cached, bundle)
+    # full
+    bundle = _apply_yahoo_updates(tickers, start, start_dt, batch_size, mode="full")
+    signature = _tickers_signature(tickers, start)
     _save_market_cache(signature, bundle)
     return _bundle_to_tuple(bundle)
 

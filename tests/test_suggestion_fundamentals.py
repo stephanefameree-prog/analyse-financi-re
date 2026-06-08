@@ -106,11 +106,13 @@ def test_filter_suggestions_by_statistics():
             "Volatilité candidat": [0.18, 0.30, 0.22],
             "Kurtosis candidat": [2.0, 6.0, 3.0],
             "Skewness candidat": [0.5, -0.2, 0.1],
+            "Sharpe candidat": [1.2, 0.3, 0.8],
             "Corr. moy. portefeuille": [0.4, 0.8, 0.55],
             "Δ Rendement portef.": [0.02, -0.01, 0.005],
             "Δ Volatilité portef.": [0.01, -0.02, 0.0],
             "Δ Kurtosis portef.": [0.3, -0.5, 0.1],
             "Δ Skewness portef.": [0.2, -0.1, 0.05],
+            "Δ Sharpe portef.": [0.15, -0.2, 0.05],
             "Δ Corr. interne": [0.05, -0.1, 0.02],
         }
     )
@@ -120,11 +122,13 @@ def test_filter_suggestions_by_statistics():
         max_candidate_vol=0.25,
         max_candidate_kurtosis=4.0,
         min_candidate_skewness=0.0,
+        min_candidate_sharpe=0.5,
         max_corr_portfolio=0.6,
         min_delta_return=0.0,
         min_delta_vol=0.0,
         min_delta_kurtosis=0.0,
         min_delta_skewness=0.0,
+        min_delta_sharpe=0.0,
         min_delta_corr_internal=0.0,
     )
     assert list(out["Ticker"]) == ["A"]

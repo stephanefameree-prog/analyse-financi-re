@@ -2,6 +2,7 @@ import re
 import random
 import time
 import json
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime
 from pathlib import Path
 
@@ -180,6 +181,13 @@ def _enrich_dividend_display_df(df):
     """Ajoute Société, Marché, Devise ; conserve Ticker pour filtres internes."""
     if df.empty or "Ticker" not in df.columns:
         return df
+    display_cols = ("Société", "Marché", "Devise")
+    if all(c in df.columns for c in display_cols):
+        out = df.copy()
+        if "Secteur" not in out.columns:
+            out["Secteur"] = "—"
+        return out
+
     out = df.copy()
     listing = get_ticker_listing_info(tuple(out["Ticker"].astype(str)))
 
@@ -368,12 +376,12 @@ def fetch_dividends_for_tickers(
         if lp is None or lp <= 0:
             stats["missing"] += 1
             continue
-        row, _ = fetch_ticker_dividend_bundle(t, lp)
+        row, source = fetch_ticker_dividend_bundle(t, lp)
         row = _normalize_suggestion_dividend_row(row)
         if row is not None:
             cache[t] = row
             if use_disk_cache:
-                save_dividend_ticker_to_disk(t, row)
+                save_dividend_ticker_to_disk(t, row, source=source)
             rows.append(row)
             stats["fetched"] += 1
         else:
@@ -399,12 +407,18 @@ def filter_suggestions_by_dividends(
     min_yield=None,
     max_yield=None,
     min_coverage=None,
+    max_coverage=None,
     min_cagr_5y=None,
+    max_cagr_5y=None,
     min_growth_years=None,
+    max_growth_years=None,
+    min_payout=None,
     max_payout=None,
+    min_fcf_payout=None,
     max_fcf_payout=None,
     active_only=False,
     min_score=None,
+    max_score=None,
 ):
     """Filtre les suggestions selon des seuils dividendes."""
     if df is None or df.empty:
@@ -418,16 +432,34 @@ def filter_suggestions_by_dividends(
         out = out[out["Rendement"].isna() | (out["Rendement"] <= max_yield)]
     if min_coverage is not None and "Ratio couverture" in out.columns:
         out = out[out["Ratio couverture"].fillna(-1) >= min_coverage]
+    if max_coverage is not None and "Ratio couverture" in out.columns:
+        out = out[
+            out["Ratio couverture"].isna()
+            | (out["Ratio couverture"] <= max_coverage)
+        ]
     if min_cagr_5y is not None and "CAGR 5 ans" in out.columns:
         out = out[out["CAGR 5 ans"].fillna(-1) >= min_cagr_5y]
+    if max_cagr_5y is not None and "CAGR 5 ans" in out.columns:
+        out = out[out["CAGR 5 ans"].isna() | (out["CAGR 5 ans"] <= max_cagr_5y)]
     if min_growth_years is not None and "Années de croissance" in out.columns:
         out = out[out["Années de croissance"].fillna(-1) >= min_growth_years]
+    if max_growth_years is not None and "Années de croissance" in out.columns:
+        out = out[
+            out["Années de croissance"].isna()
+            | (out["Années de croissance"] <= max_growth_years)
+        ]
+    if min_payout is not None and "Payout" in out.columns:
+        out = out[out["Payout"].isna() | (out["Payout"] >= min_payout)]
     if max_payout is not None and "Payout" in out.columns:
         out = out[out["Payout"].isna() | (out["Payout"] <= max_payout)]
+    if min_fcf_payout is not None and "FCF Payout" in out.columns:
+        out = out[out["FCF Payout"].isna() | (out["FCF Payout"] >= min_fcf_payout)]
     if max_fcf_payout is not None and "FCF Payout" in out.columns:
         out = out[out["FCF Payout"].isna() | (out["FCF Payout"] <= max_fcf_payout)]
     if min_score is not None and "Score" in out.columns:
         out = out[out["Score"].fillna(-1) >= min_score]
+    if max_score is not None and "Score" in out.columns:
+        out = out[out["Score"].isna() | (out["Score"] <= max_score)]
     return out
 
 
@@ -477,10 +509,18 @@ def load_dividend_universe():
 
 
 def save_dividend_universe(data):
+    _dedupe_universe_ticker_maps(data)
     data.setdefault("meta", {})["updated_at"] = datetime.now().isoformat(timespec="seconds")
     path = _dividends_universe_path()
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = path.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+    try:
+        tmp.replace(path)
+    except OSError as exc:
+        raise OSError(
+            f"Impossible d'écrire {path} (fichier verrouillé par OneDrive ?) : {exc}"
+        ) from exc
 
 
 def load_tickers_from_json(json_path="tickers.json"):
@@ -490,6 +530,104 @@ def load_tickers_from_json(json_path="tickers.json"):
     with open(path, encoding="utf-8") as f:
         payload = json.load(f)
     return sorted({str(t).strip() for values in payload.values() for t in values if str(t).strip()})
+
+
+def _normalize_universe_ticker(ticker):
+    """Strip espaces — forme minimale pour clés univers."""
+    return str(ticker).strip()
+
+
+def _resolve_universe_ticker_key(mapping, ticker):
+    """Retourne la clé déjà stockée si le ticker est équivalent (strip / casse)."""
+    norm = _normalize_universe_ticker(ticker)
+    if not norm or not mapping:
+        return None
+    if norm in mapping:
+        return norm
+    upper = norm.upper()
+    for key in mapping:
+        if str(key).strip().upper() == upper:
+            return str(key).strip()
+    return None
+
+
+def _merge_universe_entries(existing, incoming):
+    """Fusionne deux entrées univers (incoming prioritaire si valeur non vide)."""
+    merged = dict(existing)
+    for key, value in incoming.items():
+        if value not in (None, "", "—") or merged.get(key) in (None, "", "—"):
+            merged[key] = value
+    store_ticker = incoming.get("Ticker") or existing.get("Ticker")
+    if store_ticker:
+        merged["Ticker"] = _normalize_universe_ticker(store_ticker)
+    return merged
+
+
+def _dedupe_universe_ticker_maps(universe):
+    """Fusionne clés ticker équivalentes dans tickers / failed_tickers."""
+    tickers = universe.get("tickers") or {}
+    failed = universe.get("failed_tickers") or {}
+    merged_tickers = {}
+    for raw_key, row in tickers.items():
+        canon = _normalize_universe_ticker(raw_key)
+        if not canon:
+            continue
+        store_key = _resolve_universe_ticker_key(merged_tickers, canon) or canon
+        entry = dict(row)
+        entry["Ticker"] = store_key
+        if store_key in merged_tickers:
+            merged_tickers[store_key] = _merge_universe_entries(
+                merged_tickers[store_key], entry
+            )
+        else:
+            merged_tickers[store_key] = entry
+
+    merged_failed = {}
+    for raw_key, message in failed.items():
+        canon = _normalize_universe_ticker(raw_key)
+        if not canon:
+            continue
+        if _resolve_universe_ticker_key(merged_tickers, canon):
+            continue
+        store_key = _resolve_universe_ticker_key(merged_failed, canon) or canon
+        if store_key not in merged_failed:
+            merged_failed[store_key] = message
+
+    universe["tickers"] = merged_tickers
+    universe["failed_tickers"] = merged_failed
+    return universe
+
+
+def _is_ticker_in_universe(ticker, universe):
+    tickers = universe.get("tickers") or {}
+    failed = universe.get("failed_tickers") or {}
+    return (
+        _resolve_universe_ticker_key(tickers, ticker) is not None
+        or _resolve_universe_ticker_key(failed, ticker) is not None
+    )
+
+
+def _universe_rows_from_store(tickers_dict):
+    """Construit les lignes affichage/CSV — clé JSON = source de vérité pour Ticker."""
+    rows = []
+    for ticker, row in (tickers_dict or {}).items():
+        store_key = _normalize_universe_ticker(ticker)
+        if not store_key:
+            continue
+        entry = dict(row)
+        entry["Ticker"] = store_key
+        rows.append(entry)
+    return rows
+
+
+def _drop_failed_ticker_variants(failed_map, store_key):
+    """Retire les variantes casse/espaces d'un ticker des échecs."""
+    if not store_key or not failed_map:
+        return
+    upper = _normalize_universe_ticker(store_key).upper()
+    for key in list(failed_map):
+        if str(key).strip().upper() == upper:
+            failed_map.pop(key, None)
 
 
 def _load_dividends_disk_store():
@@ -507,15 +645,39 @@ def _load_dividends_disk_store():
     return {"version": 1, "portfolios": {}, "tickers": {}}
 
 
+_DISK_STORE_CACHE = None
+
+
+def _load_dividends_disk_store_cached():
+    global _DISK_STORE_CACHE
+    if _DISK_STORE_CACHE is None:
+        _DISK_STORE_CACHE = _load_dividends_disk_store()
+    return _DISK_STORE_CACHE
+
+
+def _invalidate_dividends_disk_cache():
+    global _DISK_STORE_CACHE
+    _DISK_STORE_CACHE = None
+
+
 def _save_dividends_disk_store(data):
     path = _dividends_cache_path()
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = path.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+    try:
+        tmp.replace(path)
+    except OSError as exc:
+        raise OSError(
+            f"Impossible d'écrire {path} (fichier verrouillé par OneDrive ?) : {exc}"
+        ) from exc
+    global _DISK_STORE_CACHE
+    _DISK_STORE_CACHE = data
 
 
 def load_dividends_rows_from_disk(ticker_signature):
     """Charge les lignes dividendes depuis le disque (TTL 24 h)."""
-    entry = _load_dividends_disk_store().get("portfolios", {}).get(ticker_signature)
+    entry = _load_dividends_disk_store_cached().get("portfolios", {}).get(ticker_signature)
     if not entry:
         return None, None
     updated_at = entry.get("updated_at")
@@ -534,7 +696,7 @@ def load_dividends_rows_from_disk(ticker_signature):
 
 def save_dividends_rows_to_disk(ticker_signature, rows):
     """Enregistre les résultats dividendes sur le disque."""
-    store = _load_dividends_disk_store()
+    store = _load_dividends_disk_store_cached()
     store.setdefault("portfolios", {})[ticker_signature] = {
         "updated_at": datetime.now().isoformat(timespec="seconds"),
         "rows": rows,
@@ -554,7 +716,7 @@ def _dividend_row_is_fresh(row, ttl_seconds=DISK_CACHE_TTL_SECONDS):
 
 def load_dividend_ticker_from_disk(ticker):
     """Charge les dividendes d'un ticker depuis le cache disque (TTL 24 h)."""
-    entry = _load_dividends_disk_store().get("tickers", {}).get(ticker)
+    entry = _load_dividends_disk_store_cached().get("tickers", {}).get(ticker)
     if not entry:
         return None
     row = entry.get("row") if isinstance(entry, dict) else entry
@@ -563,16 +725,18 @@ def load_dividend_ticker_from_disk(ticker):
     return None
 
 
-def save_dividend_ticker_to_disk(ticker, row):
+def save_dividend_ticker_to_disk(ticker, row, sync_universe=True, source=None):
     """Enregistre les dividendes d'un ticker sur le disque."""
     if not row:
         return
-    store = _load_dividends_disk_store()
+    store = _load_dividends_disk_store_cached()
     store.setdefault("tickers", {})[ticker] = {
         "updated_at": datetime.now().isoformat(timespec="seconds"),
         "row": row,
     }
     _save_dividends_disk_store(store)
+    if sync_universe:
+        sync_dividend_universe_from_cache_row(ticker, row, source=source)
 
 
 def clear_dividends_disk_cache(ticker_signature=None):
@@ -581,8 +745,9 @@ def clear_dividends_disk_cache(ticker_signature=None):
         path = _dividends_cache_path()
         if path.is_file():
             path.unlink()
+        _invalidate_dividends_disk_cache()
         return
-    store = _load_dividends_disk_store()
+    store = _load_dividends_disk_store_cached()
     portfolios = store.get("portfolios", {})
     if ticker_signature in portfolios:
         del portfolios[ticker_signature]
@@ -684,9 +849,10 @@ def _extract_dividends_from_history(hist, ticker_symbol):
     return s.sort_index()
 
 
-def get_dividends_yfinance_native(ticker):
+def get_dividends_yfinance_native(ticker, period="max"):
+    yt = yf.Ticker(ticker)
     try:
-        s = yf.Ticker(ticker).dividends
+        s = yt.dividends
         if s is not None and not s.empty:
             s = pd.to_numeric(s, errors="coerce").dropna()
             s = s[s > 0]
@@ -697,7 +863,7 @@ def get_dividends_yfinance_native(ticker):
         pass
 
     try:
-        hist = yf.Ticker(ticker).history(period="max", auto_adjust=False)
+        hist = yt.history(period=period, auto_adjust=False)
         s = _extract_dividends_from_history(hist, ticker)
         if s is not None:
             return s
@@ -707,7 +873,7 @@ def get_dividends_yfinance_native(ticker):
     try:
         hist2 = yf.download(
             ticker,
-            period="max",
+            period=period,
             auto_adjust=False,
             actions=True,
             progress=False,
@@ -784,15 +950,26 @@ def get_dividends_lecho(isin):
     return pd.Series(vals, index=idx).sort_index()
 
 
-def fetch_dividend_series(ticker):
+def fetch_dividend_series(ticker, lite=False):
+    eu_suffixes = (".PA", ".DE", ".BR", ".AS", ".MI", ".MC", ".SW", ".L", ".IR", ".HE")
+    yf_period = "1y" if lite else "max"
     for name, fn in (
         ("YahooQuery", get_dividends_yahoo),
-        ("yfinance", get_dividends_yfinance_native),
-        ("Boursorama", get_dividends_boursorama),
+        ("yfinance", lambda t: get_dividends_yfinance_native(t, period=yf_period)),
     ):
         s = fn(ticker)
         if s is not None and not s.empty:
             return s, name
+
+    if lite and not any(str(ticker).upper().endswith(sfx) for sfx in eu_suffixes):
+        return None, None
+
+    s = get_dividends_boursorama(ticker)
+    if s is not None and not s.empty:
+        return s, "Boursorama"
+
+    if lite:
+        return None, None
 
     isin = get_isin_from_yahoo(ticker)
     if isin:
@@ -933,6 +1110,49 @@ def _consecutive_growth_years(annual):
     return streak
 
 
+def _yahooquery_profile_lite(ticker):
+    """Prix + métadonnées listing en un seul appel yahooquery (mode lite)."""
+    tk = str(ticker).strip()
+    listing = {
+        "Société": tk,
+        "Secteur": "—",
+        "Marché": _infer_market_from_ticker(tk) or "—",
+        "Devise": _infer_currency_from_ticker(tk) or "—",
+    }
+    last_price = None
+    try:
+        tq = Ticker(tk, timeout=20)
+        payload = tq.price
+        profiles = tq.asset_profile
+        block = payload.get(tk) if isinstance(payload, dict) else None
+        if isinstance(block, dict):
+            name = block.get("shortName") or block.get("longName")
+            if name:
+                listing["Société"] = str(name)
+            market = block.get("fullExchangeName") or block.get("exchange")
+            listing["Marché"] = _normalize_market_label(market, tk)
+            currency = block.get("currency")
+            if currency:
+                listing["Devise"] = str(currency)
+            for key in ("regularMarketPrice", "postMarketPrice", "preMarketPrice"):
+                val = block.get(key)
+                if val is None:
+                    continue
+                try:
+                    price = float(val)
+                except (TypeError, ValueError):
+                    continue
+                if price > 0:
+                    last_price = price
+                    break
+        profile = profiles.get(tk) if isinstance(profiles, dict) else None
+        if isinstance(profile, dict) and profile.get("sector"):
+            listing["Secteur"] = str(profile["sector"])
+    except Exception:
+        pass
+    return last_price, listing
+
+
 def get_last_price_yahoo(ticker):
     try:
         info = yf.Ticker(ticker).info or {}
@@ -1006,16 +1226,22 @@ def compute_avg_yield_5y(div_series, ticker):
         return None
 
 
-def fetch_comprehensive_dividend_profile(ticker):
+def fetch_comprehensive_dividend_profile(ticker, lite=False):
     """Profil dividendes complet (style Investing.com) pour un ticker."""
     ticker = str(ticker).strip()
-    last_price = get_last_price_yahoo(ticker)
-    series, source = fetch_dividend_series(ticker)
-    ex_date, pay_date = get_upcoming_dividend_dates(ticker)
-    payout, fcf_payout = get_payout_ratios_yahoo(ticker)
-    listing = _listing_fields_for_ticker(ticker)
+    if lite:
+        last_price, listing = _yahooquery_profile_lite(ticker)
+        if last_price is None:
+            last_price = get_last_price_yahoo(ticker)
+    else:
+        last_price = get_last_price_yahoo(ticker)
+        listing = _listing_fields_for_ticker(ticker)
+    series, source = fetch_dividend_series(ticker, lite=lite)
+    ex_date, pay_date = (None, None) if lite else get_upcoming_dividend_dates(ticker)
+    payout, fcf_payout = (None, None) if lite else get_payout_ratios_yahoo(ticker)
     base_listing = {
         "Société": listing["Société"],
+        "Secteur": listing.get("Secteur", "—"),
         "Marché": listing["Marché"],
         "Devise": listing["Devise"],
     }
@@ -1082,7 +1308,7 @@ def fetch_comprehensive_dividend_profile(ticker):
         "Série croissance (ans)": _consecutive_growth_years(paid_annual) if active else 0,
         "Ex-dividende à venir": ex_date if active else None,
         "Paiement à venir": pay_date if active else None,
-        "Rendement moy. 5 ans (%)": compute_avg_yield_5y(series, ticker),
+        "Rendement moy. 5 ans (%)": None if lite else compute_avg_yield_5y(series, ticker),
         "Dividende / action": dps,
         "Dividende TTM": ttm if active else 0.0,
         "Dernier versement": last_pay_str,
@@ -1093,49 +1319,18 @@ def fetch_comprehensive_dividend_profile(ticker):
     }
 
 
-def process_dividend_universe_batch(
-    tickers,
-    universe=None,
-    limit=None,
-    sleep_seconds=0.25,
-    save_every=20,
-    progress_callback=None,
-):
-    """Traite un lot de tickers et met à jour dividendes_universe.json."""
-    universe = universe or load_dividend_universe()
-    universe.setdefault("tickers", {})
-    universe.setdefault("failed_tickers", {})
-    meta = universe.setdefault("meta", {})
-    meta["total_target"] = len(tickers)
-
-    pending = [t for t in tickers if t not in universe["tickers"] and t not in universe["failed_tickers"]]
-    if limit is not None:
-        pending = pending[:limit]
-
-    processed_now = 0
-    batch_total = len(pending)
-    for i, ticker in enumerate(pending):
-        if i > 0 and sleep_seconds:
-            time.sleep(random.uniform(sleep_seconds * 0.6, sleep_seconds * 1.4))
+def _fetch_dividend_profile_with_timeout(ticker, lite=False, timeout_seconds=50):
+    """Évite qu'un ticker bloque indéfiniment (yfinance sans timeout)."""
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(fetch_comprehensive_dividend_profile, ticker, lite=lite)
         try:
-            row = fetch_comprehensive_dividend_profile(ticker)
-            universe["tickers"][ticker] = row
-        except Exception as exc:
-            universe["failed_tickers"][ticker] = str(exc)
-        processed_now += 1
-        if progress_callback and batch_total:
-            progress_callback((i + 1) / batch_total, ticker, processed_now, batch_total)
-        if processed_now % save_every == 0:
-            meta["with_dividends"] = sum(
-                1 for r in universe["tickers"].values() if r.get("A des dividendes")
-            )
-            meta["without_dividends"] = sum(
-                1 for r in universe["tickers"].values() if not r.get("A des dividendes")
-            )
-            meta["failed"] = len(universe["failed_tickers"])
-            meta["processed"] = len(universe["tickers"]) + len(universe["failed_tickers"])
-            save_dividend_universe(universe)
+            return future.result(timeout=timeout_seconds)
+        except FuturesTimeoutError as exc:
+            raise TimeoutError(f"Timeout après {timeout_seconds}s") from exc
 
+
+def _refresh_universe_meta(universe):
+    meta = universe.setdefault("meta", {})
     meta["with_dividends"] = sum(
         1 for r in universe["tickers"].values() if r.get("A des dividendes")
     )
@@ -1144,6 +1339,162 @@ def process_dividend_universe_batch(
     )
     meta["failed"] = len(universe["failed_tickers"])
     meta["processed"] = len(universe["tickers"]) + len(universe["failed_tickers"])
+
+
+_UNIVERSE_FIELDS_FROM_EXISTING = (
+    "Fréquence",
+    "Croissance 1 an (%)",
+    "Croissance 3 ans (%)",
+    "Ex-dividende à venir",
+    "Paiement à venir",
+    "Rendement moy. 5 ans (%)",
+    "Dividende total historique",
+    "Série versement (ans)",
+)
+
+
+def _cache_row_to_universe_entry(row, listing=None, source=None):
+    """Convertit une ligne cache portefeuille/suggestions vers le format univers."""
+    ticker = str(row.get("Ticker", "")).strip()
+    if not ticker:
+        return None
+    listing = listing or {}
+    payout = row.get("Payout")
+    fcf_payout = row.get("FCF Payout")
+    active = row.get("Statut") == "Actif"
+    growth_years = row.get("Années de croissance")
+    ttm = row.get("Dividende annuel (TTM)")
+
+    coverage = (1.0 / payout) if payout and payout > 0 else None
+    fcf_coverage = (1.0 / fcf_payout) if fcf_payout and fcf_payout > 0 else None
+
+    return {
+        "Ticker": ticker,
+        "Société": listing.get("Société") or ticker,
+        "Secteur": listing.get("Secteur", "—"),
+        "Marché": listing.get("Marché", "—"),
+        "Devise": listing.get("Devise", "—"),
+        "Prix": row.get("Prix"),
+        "Statut": row.get("Statut"),
+        "Rendement (%)": row.get("Rendement") if active else None,
+        "Fréquence": None,
+        "Croissance 1 an (%)": None,
+        "Croissance 3 ans (%)": None,
+        "Croissance 5 ans (%)": row.get("CAGR 5 ans") if active else None,
+        "Ratio couverture": coverage,
+        "Ratio couverture FCF": fcf_coverage,
+        "Taux versement (%)": payout,
+        "Série versement (ans)": None,
+        "Série croissance (ans)": growth_years if active else 0,
+        "Ex-dividende à venir": None,
+        "Paiement à venir": None,
+        "Rendement moy. 5 ans (%)": None,
+        "Dividende / action": ttm if active else None,
+        "Dividende TTM": ttm if active else 0.0,
+        "Dernier versement": row.get("Dernier versement"),
+        "DPS dernier versement": row.get("DPS dernier versement"),
+        "Dividende total historique": None,
+        "Source": source or row.get("Source") or "cache",
+        "A des dividendes": active,
+    }
+
+
+def sync_dividend_universe_from_cache_row(ticker, row, source=None):
+    """
+    Met à jour dividendes_universe.json quand un ticker vient d'être fetché (cache disque).
+    Conserve les champs détaillés déjà présents (fréquence, dates ex-div, historique…).
+    """
+    ticker = _normalize_universe_ticker(ticker)
+    if not row or not ticker:
+        return
+
+    universe = load_dividend_universe()
+    tickers_map = universe.setdefault("tickers", {})
+    store_key = _resolve_universe_ticker_key(tickers_map, ticker) or ticker
+    existing = tickers_map.get(store_key, {})
+
+    if existing.get("Société") and existing.get("Société") != store_key:
+        listing = {
+            "Société": existing.get("Société"),
+            "Secteur": existing.get("Secteur", "—"),
+            "Marché": existing.get("Marché", "—"),
+            "Devise": existing.get("Devise", "—"),
+        }
+    else:
+        listing = _listing_fields_for_ticker(store_key)
+    entry = _cache_row_to_universe_entry(row, listing=listing, source=source)
+    if not entry:
+        return
+    entry["Ticker"] = store_key
+
+    for key in _UNIVERSE_FIELDS_FROM_EXISTING:
+        if entry.get(key) in (None, 0, "—") and existing.get(key) not in (None, "", "—"):
+            entry[key] = existing[key]
+
+    if existing:
+        entry = _merge_universe_entries(existing, entry)
+
+    tickers_map[store_key] = entry
+    failed = universe.setdefault("failed_tickers", {})
+    _drop_failed_ticker_variants(failed, store_key)
+    _refresh_universe_meta(universe)
+    save_dividend_universe(universe)
+
+
+def process_dividend_universe_batch(
+    tickers,
+    universe=None,
+    limit=None,
+    sleep_seconds=0.25,
+    save_every=50,
+    progress_callback=None,
+    lite=True,
+    timeout_seconds=50,
+):
+    """Traite un lot de tickers et met à jour dividendes_universe.json."""
+    universe = universe or load_dividend_universe()
+    universe.setdefault("tickers", {})
+    universe.setdefault("failed_tickers", {})
+    meta = universe.setdefault("meta", {})
+    meta["total_target"] = len(tickers)
+
+    pending = [t for t in tickers if not _is_ticker_in_universe(t, universe)]
+    if limit is not None:
+        pending = pending[:limit]
+
+    processed_now = 0
+    batch_total = len(pending)
+    for i, ticker in enumerate(pending):
+        if i > 0 and sleep_seconds:
+            time.sleep(random.uniform(sleep_seconds * 0.6, sleep_seconds * 1.4))
+        store_key = _normalize_universe_ticker(ticker)
+        try:
+            row = _fetch_dividend_profile_with_timeout(
+                ticker, lite=lite, timeout_seconds=timeout_seconds
+            )
+            resolved = (
+                _resolve_universe_ticker_key(universe["tickers"], store_key) or store_key
+            )
+            if isinstance(row, dict):
+                row = dict(row)
+                row["Ticker"] = resolved
+            universe["tickers"][resolved] = row
+            _drop_failed_ticker_variants(universe["failed_tickers"], resolved)
+        except Exception as exc:
+            resolved = (
+                _resolve_universe_ticker_key(universe["failed_tickers"], store_key)
+                or store_key
+            )
+            if not _resolve_universe_ticker_key(universe["tickers"], store_key):
+                universe["failed_tickers"][resolved] = str(exc)
+        processed_now += 1
+        if progress_callback and batch_total:
+            progress_callback((i + 1) / batch_total, ticker, processed_now, batch_total)
+        if save_every and processed_now % save_every == 0:
+            _refresh_universe_meta(universe)
+            save_dividend_universe(universe)
+
+    _refresh_universe_meta(universe)
     save_dividend_universe(universe)
     return universe, processed_now
 
@@ -1237,24 +1588,357 @@ def compute_dividend_quality_score(m, p, fcf):
     }
 
 
-def radar_score_chart(scores, ticker):
-    labels = ["Stabilité", "Croissance", "Payout", "FCF Payout", "Rendement"]
-    values = [
-        scores["stability"],
-        scores["growth"],
-        scores["payout"],
-        scores["fcf_payout"],
-        scores["yield"],
-    ]
-    values_closed = values + [values[0]]
-    labels_closed = labels + [labels[0]]
+_DIVIDEND_RADAR_MAX = {
+    "stability": 30,
+    "growth": 25,
+    "payout": 20,
+    "fcf_payout": 20,
+    "yield": 5,
+}
+_DIVIDEND_RADAR_TARGET_PCT = 70
+
+
+def build_dividend_yield_score_scatter(df, title="Rendement vs score qualité dividendes"):
+    """Nuage rendement × score — labels au survol uniquement (évite le chevauchement)."""
+    from chart_theme import CHART_HEIGHT, apply_chart_theme
+
+    if df is None or df.empty:
+        return None
+    plot = df.copy()
+    if "Rendement" not in plot.columns or "Score" not in plot.columns:
+        return None
+    plot = plot.dropna(subset=["Rendement", "Score"])
+    if plot.empty:
+        return None
+
+    societe = plot["Société"].astype(str) if "Société" in plot.columns else plot["Ticker"].astype(str)
+    ticker = plot["Ticker"].astype(str) if "Ticker" in plot.columns else societe
+    marche = plot["Marché"].astype(str) if "Marché" in plot.columns else pd.Series("—", index=plot.index)
+
+    sizes = np.clip(plot["Score"].astype(float) / 4.0 + 10.0, 10.0, 32.0)
     fig = go.Figure()
     fig.add_trace(
-        go.Scatterpolar(r=values_closed, theta=labels_closed, fill="toself", marker_color="teal")
+        go.Scatter(
+            x=plot["Rendement"],
+            y=plot["Score"],
+            mode="markers",
+            marker=dict(
+                size=sizes,
+                color=plot["Score"],
+                colorscale="RdYlGn",
+                colorbar=dict(title="Score"),
+                line=dict(width=0.5, color="#334155"),
+            ),
+            customdata=np.column_stack([societe, ticker, marche]),
+            hovertemplate=(
+                "<b>%{customdata[0]}</b> (%{customdata[1]})<br>"
+                "Rendement : %{x:.2%}<br>Score : %{y:.0f}<br>"
+                "Marché : %{customdata[2]}<extra></extra>"
+            ),
+        )
+    )
+    fig.update_xaxes(tickformat=".1%")
+    fig.update_layout(xaxis_title="Rendement (TTM)", yaxis_title="Score qualité (/ ~100)")
+    apply_chart_theme(fig, height=CHART_HEIGHT.get("scatter", 480), title=title)
+    return fig
+
+
+def build_dividend_universe_histogram(
+    values,
+    *,
+    title,
+    xaxis_title,
+    tickformat=None,
+    nbins=35,
+):
+    """
+    Histogramme (abscisse = métrique, ordonnée = nombre d'actions)
+    avec médiane, percentiles 25 et 75.
+    """
+    from chart_theme import CHART_HEIGHT, apply_chart_theme
+
+    s = pd.Series(values, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+    if s.empty:
+        return None
+
+    p25 = float(s.quantile(0.25))
+    med = float(s.median())
+    p75 = float(s.quantile(0.75))
+    x_max = float(s.max())
+    x_min = 0.0 if s.min() >= 0 else float(s.min())
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Histogram(
+            x=s,
+            nbinsx=nbins,
+            name="Actions",
+            marker_color="rgba(37, 99, 235, 0.72)",
+            marker_line=dict(color="white", width=0.4),
+            hovertemplate="%{x}<br>%{y} action(s)<extra></extra>",
+        )
+    )
+    ref_lines = [
+        (p25, "P25", "#f97316", "dash"),
+        (med, "Médiane", "#dc2626", "solid"),
+        (p75, "P75", "#059669", "dash"),
+    ]
+    for x_val, label, color, dash in ref_lines:
+        fig.add_vline(
+            x=x_val,
+            line_width=2,
+            line_dash=dash,
+            line_color=color,
+            annotation_text=label,
+            annotation_position="top",
+            annotation_font_size=10,
+            annotation_font_color=color,
+        )
+
+    xaxis = dict(title=xaxis_title, range=[x_min, x_max * 1.05 if x_max > x_min else x_min + 1])
+    if tickformat:
+        xaxis["tickformat"] = tickformat
+    fig.update_layout(
+        xaxis=xaxis,
+        yaxis_title="Nombre d'actions",
+        bargap=0.05,
+    )
+    subtitle = f"n = {len(s)} · P25 = {_fmt_hist_stat(p25, tickformat)} · médiane = {_fmt_hist_stat(med, tickformat)} · P75 = {_fmt_hist_stat(p75, tickformat)}"
+    apply_chart_theme(
+        fig,
+        height=CHART_HEIGHT.get("histogram", 360),
+        title=f"{title}<br><sup style='font-size:11px;color:#64748b'>{subtitle}</sup>",
+    )
+    fig.update_layout(margin=dict(t=88, l=48, r=32, b=52))
+    return fig
+
+
+def _fmt_hist_stat(val, tickformat):
+    if tickformat == ".1%":
+        return f"{val:.2%}"
+    if tickformat:
+        return f"{val:{tickformat}}"
+    return f"{val:.2f}"
+
+
+def _universe_numeric_series(df, column):
+    """Série numérique propre pour histogrammes univers dividendes."""
+    if df is None or df.empty or column not in df.columns:
+        return pd.Series(dtype=float)
+    return pd.to_numeric(df[column], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+
+
+DIVIDEND_FREQUENCY_ORDER = {
+    "Mensuelle": 0,
+    "Trimestrielle": 1,
+    "Semestrielle": 2,
+    "Annuelle": 3,
+    "Irregulière": 4,
+    "Aucun": 5,
+}
+
+
+def _dividend_frequency_options(df):
+    """Fréquences présentes dans l'univers, triées du plus au moins fréquent."""
+    if df is None or df.empty or "Fréquence" not in df.columns:
+        return []
+    values = (
+        df["Fréquence"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .replace("", np.nan)
+        .dropna()
+        .unique()
+        .tolist()
+    )
+    return sorted(values, key=lambda x: (DIVIDEND_FREQUENCY_ORDER.get(x, 99), x))
+
+
+def filter_dividend_universe_by_ranges(
+    df,
+    *,
+    yield_min=None,
+    yield_max=None,
+    coverage_min=None,
+    coverage_max=None,
+    frequencies=None,
+):
+    """Filtre l'univers selon plages rendement, couverture et fréquence de versement."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if yield_min is not None or yield_max is not None:
+        if "Rendement (%)" not in out.columns:
+            return out.iloc[0:0]
+        y = pd.to_numeric(out["Rendement (%)"], errors="coerce")
+        mask = y.notna()
+        if yield_min is not None:
+            mask &= y >= yield_min
+        if yield_max is not None:
+            mask &= y <= yield_max
+        out = out[mask]
+    if coverage_min is not None or coverage_max is not None:
+        if "Ratio couverture" not in out.columns:
+            return out.iloc[0:0]
+        c = pd.to_numeric(out["Ratio couverture"], errors="coerce")
+        mask = c.notna()
+        if coverage_min is not None:
+            mask &= c >= coverage_min
+        if coverage_max is not None:
+            mask &= c <= coverage_max
+        out = out[mask]
+    if frequencies is not None:
+        if "Fréquence" not in out.columns:
+            return out.iloc[0:0]
+        allowed = {str(f).strip() for f in frequencies if str(f).strip()}
+        if not allowed:
+            return out.iloc[0:0]
+        freq = out["Fréquence"].astype(str).str.strip()
+        out = out[freq.isin(allowed)]
+    return out
+
+
+def build_dividend_yield_coverage_scatter(
+    df,
+    *,
+    title="Rendement vs ratio de couverture",
+):
+    """Nuage rendement × couverture pour l'univers dividendes."""
+    from chart_theme import CHART_HEIGHT, apply_chart_theme
+
+    if df is None or df.empty:
+        return None
+    if "Rendement (%)" not in df.columns or "Ratio couverture" not in df.columns:
+        return None
+
+    plot = df.copy()
+    plot["_yield"] = pd.to_numeric(plot["Rendement (%)"], errors="coerce")
+    plot["_cov"] = pd.to_numeric(plot["Ratio couverture"], errors="coerce")
+    plot = plot.dropna(subset=["_yield", "_cov"])
+    plot = plot[(plot["_yield"] > 0) & (plot["_cov"] > 0)]
+    if plot.empty:
+        return None
+
+    societe = (
+        plot["Société"].astype(str)
+        if "Société" in plot.columns
+        else plot["Ticker"].astype(str)
+    )
+    ticker = plot["Ticker"].astype(str) if "Ticker" in plot.columns else societe
+    marche = (
+        plot["Marché"].astype(str)
+        if "Marché" in plot.columns
+        else pd.Series("—", index=plot.index)
+    )
+
+    med_y = float(plot["_yield"].median())
+    med_c = float(plot["_cov"].median())
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=plot["_yield"],
+            y=plot["_cov"],
+            mode="markers",
+            marker=dict(
+                size=9,
+                color=plot["_cov"],
+                colorscale="RdYlGn",
+                cmin=plot["_cov"].quantile(0.05),
+                cmax=plot["_cov"].quantile(0.95),
+                colorbar=dict(title="Couverture (×)"),
+                line=dict(width=0.4, color="#334155"),
+                opacity=0.85,
+            ),
+            customdata=np.column_stack([societe, ticker, marche]),
+            hovertemplate=(
+                "<b>%{customdata[0]}</b> (%{customdata[1]})<br>"
+                "Rendement : %{x:.2%}<br>Couverture : %{y:.2f}×<br>"
+                "Marché : %{customdata[2]}<extra></extra>"
+            ),
+        )
+    )
+    fig.add_vline(
+        x=med_y,
+        line_dash="dash",
+        line_color="#dc2626",
+        line_width=1.5,
+        annotation_text="Médiane rend.",
+        annotation_position="top",
+        annotation_font_size=10,
+    )
+    fig.add_hline(
+        y=med_c,
+        line_dash="dash",
+        line_color="#059669",
+        line_width=1.5,
+        annotation_text="Médiane couv.",
+        annotation_position="right",
+        annotation_font_size=10,
+    )
+    fig.update_xaxes(tickformat=".1%", title="Rendement (%)")
+    fig.update_yaxes(title="Ratio de couverture (×)")
+    apply_chart_theme(
+        fig,
+        height=CHART_HEIGHT.get("scatter", 480),
+        title=title,
+        legend_horizontal=False,
+    )
+    fig.update_layout(showlegend=False)
+    return fig
+
+
+def radar_score_chart(scores, ticker):
+    """Radar normalisé 0–100 avec zone cible (70 %) et scores bruts au survol."""
+    from chart_theme import CHART_HEIGHT, apply_chart_theme
+
+    labels = ["Stabilité", "Croissance", "Payout", "FCF Payout", "Rendement"]
+    keys = ["stability", "growth", "payout", "fcf_payout", "yield"]
+    raw = [float(scores.get(k, 0) or 0) for k in keys]
+    normalized = [
+        min(100.0, raw[i] / _DIVIDEND_RADAR_MAX[k] * 100.0) if _DIVIDEND_RADAR_MAX[k] else 0.0
+        for i, k in enumerate(keys)
+    ]
+    target = [_DIVIDEND_RADAR_TARGET_PCT] * len(labels)
+    values_closed = normalized + [normalized[0]]
+    target_closed = target + [target[0]]
+    labels_closed = labels + [labels[0]]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatterpolar(
+            r=target_closed,
+            theta=labels_closed,
+            fill="toself",
+            fillcolor="rgba(148, 163, 184, 0.25)",
+            line=dict(color="#94a3b8", dash="dot", width=1.5),
+            name="Zone cible (70 %)",
+            hoverinfo="skip",
+        )
+    )
+    fig.add_trace(
+        go.Scatterpolar(
+            r=values_closed,
+            theta=labels_closed,
+            fill="toself",
+            fillcolor="rgba(0, 137, 123, 0.25)",
+            line=dict(color="#00897b", width=2),
+            marker=dict(size=8, color="#00695c"),
+            customdata=[[labels[i], raw[i], normalized[i]] for i in range(len(labels))] + [[labels[0], raw[0], normalized[0]]],
+            hovertemplate="%{theta}<br>Score : %{customdata[1]:.0f} / max<br>Normalisé : %{customdata[2]:.0f} %<extra></extra>",
+            name="Profil",
+        )
     )
     fig.update_layout(
-        polar=dict(radialaxis=dict(visible=True, range=[0, 30])),
-        title=f"Profil de Qualité du Dividende - {ticker}",
+        polar=dict(radialaxis=dict(visible=True, range=[0, 100], ticksuffix=" %")),
+        showlegend=True,
+    )
+    apply_chart_theme(
+        fig,
+        height=CHART_HEIGHT.get("radar", 420),
+        title=f"Profil qualité dividende — {ticker}",
+        legend_horizontal=True,
     )
     return fig
 
@@ -1325,12 +2009,14 @@ def _analyze_ticker_list(tickers, last_prices, existing_rows, ticker_signature=N
         row, source = fetch_ticker_dividend_bundle(t, lp)
         if row is not None:
             existing_rows.append(row)
+            save_dividend_ticker_to_disk(t, row, source=source)
             source_counts[source or "yfinance"] = source_counts.get(source or "yfinance", 0) + 1
-            if ticker_signature:
-                save_dividends_rows_to_disk(ticker_signature, existing_rows)
         else:
             source_counts["Echecs"] += 1
         progress.progress((i + 1) / len(pending))
+
+    if ticker_signature and existing_rows:
+        save_dividends_rows_to_disk(ticker_signature, existing_rows)
 
     status.empty()
     progress.empty()
@@ -1411,8 +2097,8 @@ Le **Score** global est la somme de 5 sous-scores (max ~100). Plus il est élev�
         )
 
 
-def _render_dividend_universe_section(portfolio_tickers=None):
-    """Exploration / mise à jour de dividendes_universe.json (tickers.json)."""
+def render_dividend_universe_builder(portfolio_tickers=None):
+    """Univers tickers.json — affiché hors fragment Streamlit (bouton + barres directes)."""
     st.markdown("### 🌍 Univers dividendes (tickers.json)")
     universe = load_dividend_universe()
     meta = universe.get("meta", {})
@@ -1423,6 +2109,11 @@ def _render_dividend_universe_section(portfolio_tickers=None):
     n_total = len(all_tickers)
 
     st.caption(f"Fichier local : `{_dividends_universe_path()}`")
+    st.caption(
+        "Les titres déjà traités sont **rafraîchis automatiquement** lors d'une analyse "
+        "dividendes (portefeuille, suggestions) ou d'un fetch Yahoo en cache — sans relancer "
+        "tout l'univers."
+    )
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Tickers cible", n_total)
     c2.metric("Traités", n_done)
@@ -1432,13 +2123,30 @@ def _render_dividend_universe_section(portfolio_tickers=None):
     if meta.get("updated_at"):
         st.caption(f"Dernière mise à jour : {meta['updated_at']}")
 
+    pending_preview = [
+        t for t in all_tickers
+        if t not in universe.get("tickers", {}) and t not in universe.get("failed_tickers", {})
+    ]
+    if pending_preview:
+        st.caption(
+            f"Prochain(s) ticker(s) : **{', '.join(pending_preview[:5])}**"
+            + (f" … (+{len(pending_preview) - 5} en attente)" if len(pending_preview) > 5 else "")
+        )
+
     batch_size = st.number_input(
         "Taille du lot (mise à jour)",
-        min_value=5,
-        max_value=500,
-        value=25,
-        step=5,
-        help="Chaque clic traite les tickers pas encore présents dans le fichier univers.",
+        min_value=10,
+        max_value=250,
+        value=50,
+        step=10,
+        key="div_universe_batch_size",
+        help="Nombre de tickers traités par clic (mode lite, ~3 s/ticker en moyenne).",
+    )
+    est_click_sec = max(15, int(batch_size) * 3)
+    st.caption(
+        f"Chaque clic traite **{int(batch_size)}** ticker(s) "
+        f"(≈ {est_click_sec // 60} min {est_click_sec % 60:02d} s). "
+        "Ne fermez pas l'onglet pendant le traitement."
     )
 
     if n_total > 0:
@@ -1453,32 +2161,66 @@ def _render_dividend_universe_section(portfolio_tickers=None):
         restant = max(0, n_total - n_done)
         if restant:
             lots_restants = (restant + int(batch_size) - 1) // int(batch_size)
+            est_sec = restant * 3
             st.caption(
                 f"Restant : {restant:,} ticker(s) "
-                f"(≈ {lots_restants:,} clic(s) de {int(batch_size)} au lot actuel)."
+                f"(≈ {lots_restants:,} clic(s) de {int(batch_size)} · "
+                f"~{est_sec // 3600} h {(est_sec % 3600) // 60} min)."
             )
 
-    if st.button("Mettre à jour l'univers dividendes (lot)", type="secondary"):
+    if st.button(
+        "Mettre à jour l'univers dividendes (lot)",
+        type="primary",
+        key="div_universe_run_batch",
+    ):
         progress_lot = st.progress(0.0, text="Préparation du lot…")
+        progress_global = st.progress(
+            min(1.0, n_done / n_total) if n_total else 0.0,
+            text=f"Global : {n_done:,} / {n_total:,}",
+        )
+        n_at_start = n_done
 
         def _on_batch_progress(pct, ticker, current, batch_len):
             progress_lot.progress(
                 min(1.0, pct),
-                text=f"Lot en cours : {current}/{batch_len} — {ticker}",
+                text=f"Lot : {current}/{batch_len} — {ticker}",
             )
+            n_live = n_at_start + current
+            if n_total:
+                progress_global.progress(
+                    min(1.0, n_live / n_total),
+                    text=(
+                        f"Global : {n_live:,} / {n_total:,} "
+                        f"({100 * n_live / n_total:.1f} %)"
+                    ),
+                )
 
-        universe, processed = process_dividend_universe_batch(
-            all_tickers,
-            universe=universe,
-            limit=int(batch_size),
-            sleep_seconds=0.2,
-            progress_callback=_on_batch_progress,
-        )
-        progress_lot.progress(1.0, text="Lot terminé.")
-        st.success(f"{processed} ticker(s) traité(s) — fichier mis à jour.")
-        st.rerun()
+        try:
+            universe, processed = process_dividend_universe_batch(
+                all_tickers,
+                universe=universe,
+                limit=int(batch_size),
+                sleep_seconds=0.2,
+                save_every=50,
+                progress_callback=_on_batch_progress,
+                lite=True,
+                timeout_seconds=50,
+            )
+            progress_lot.progress(1.0, text="Lot terminé.")
+            st.success(f"{processed} ticker(s) traité(s) — fichier mis à jour.")
+            st.rerun()
+        except Exception as exc:
+            st.exception(exc)
+            st.caption(
+                f"Repli : `python build_dividend_universe.py --limit {int(batch_size)}`"
+            )
+        return
 
-    rows = list(universe.get("tickers", {}).values())
+    st.caption(
+        f"Gros volume : `python build_dividend_universe.py --limit {int(batch_size)}`"
+    )
+
+    rows = _universe_rows_from_store(universe.get("tickers", {}))
     if not rows:
         st.info(
             "L'univers n'est pas encore construit. Cliquez sur **Mettre à jour l'univers dividendes** "
@@ -1509,7 +2251,12 @@ def _render_dividend_universe_section(portfolio_tickers=None):
         "Source",
     ]
 
-    full_df = _enrich_dividend_display_df(pd.DataFrame(rows))
+    enrich_key = f"div_universe_df_{meta.get('updated_at', '')}"
+    if enrich_key not in st.session_state:
+        st.session_state[enrich_key] = _enrich_dividend_display_df(pd.DataFrame(rows))
+    full_df = st.session_state[enrich_key].copy()
+    if "Ticker" in full_df.columns:
+        full_df = full_df.drop_duplicates(subset=["Ticker"], keep="last")
     only_div = st.checkbox("Afficher seulement les titres avec dividendes", value=True)
     if only_div and "A des dividendes" in full_df.columns:
         full_df = full_df[full_df["A des dividendes"]]
@@ -1518,6 +2265,130 @@ def _render_dividend_universe_section(portfolio_tickers=None):
         pf = st.checkbox("Limiter à mon portefeuille / watchlist actuelle", value=False)
         if pf:
             full_df = full_df[full_df["Ticker"].isin(portfolio_tickers)]
+
+    dividend_base_count = len(full_df)
+    chart_base = full_df.copy()
+    freq_options = _dividend_frequency_options(chart_base)
+    selected_freq = None
+    if freq_options:
+        selected_freq = st.multiselect(
+            "Fréquence des dividendes",
+            options=freq_options,
+            default=freq_options,
+            key="div_univ_freq_filter",
+            help=(
+                "Filtre le tableau et les graphiques selon le rythme de versement "
+                "(mensuelle, trimestrielle, semestrielle, annuelle…)."
+            ),
+        )
+        chart_base = filter_dividend_universe_by_ranges(
+            chart_base,
+            frequencies=selected_freq,
+        )
+        if not selected_freq:
+            st.caption("Aucune fréquence sélectionnée — tableau et graphiques vides.")
+
+    yield_series = _universe_numeric_series(chart_base, "Rendement (%)")
+    yield_series = yield_series[yield_series > 0]
+    cov_series = _universe_numeric_series(chart_base, "Ratio couverture")
+    cov_series = cov_series[cov_series > 0]
+
+    if not yield_series.empty or not cov_series.empty:
+        st.markdown("#### Distribution — titres avec dividendes")
+        filt1, filt2 = st.columns(2)
+        yield_max_pct = float(yield_series.max() * 100) if not yield_series.empty else 12.0
+        yield_step = 0.1 if yield_max_pct <= 15 else 0.25
+        if not yield_series.empty:
+            with filt1:
+                yield_lo_pct, yield_hi_pct = st.slider(
+                    "Plage rendement (%)",
+                    0.0,
+                    round(yield_max_pct, 2),
+                    (0.0, round(yield_max_pct, 2)),
+                    step=yield_step,
+                    key="div_univ_yield_range",
+                    help="Filtre les graphiques et le tableau ci-dessous.",
+                )
+            yield_lo, yield_hi = yield_lo_pct / 100.0, yield_hi_pct / 100.0
+        else:
+            yield_lo = yield_hi = None
+            filt1.caption("Rendement : aucune donnée disponible.")
+
+        cov_max = float(cov_series.max()) if not cov_series.empty else 5.0
+        cov_max = max(cov_max, 0.5)
+        if not cov_series.empty:
+            with filt2:
+                cov_lo, cov_hi = st.slider(
+                    "Plage ratio de couverture (×)",
+                    0.0,
+                    round(cov_max, 2),
+                    (0.0, round(cov_max, 2)),
+                    step=0.1,
+                    key="div_univ_coverage_range",
+                    help="Bénéfices ÷ dividendes. Filtre les graphiques et le tableau.",
+                )
+        else:
+            cov_lo = cov_hi = None
+            filt2.caption("Couverture : aucune donnée disponible.")
+
+        filtered_df = filter_dividend_universe_by_ranges(
+            chart_base,
+            yield_min=yield_lo,
+            yield_max=yield_hi,
+            coverage_min=cov_lo,
+            coverage_max=cov_hi,
+        )
+        hist_yield = _universe_numeric_series(filtered_df, "Rendement (%)")
+        hist_yield = hist_yield[hist_yield > 0]
+        hist_cov = _universe_numeric_series(filtered_df, "Ratio couverture")
+        hist_cov = hist_cov[hist_cov > 0]
+
+        h1, h2 = st.columns(2)
+        fig_yield = build_dividend_universe_histogram(
+            hist_yield,
+            title="Répartition des rendements",
+            xaxis_title="Rendement (%)",
+            tickformat=".1%",
+        )
+        if fig_yield is not None:
+            h1.plotly_chart(fig_yield, use_container_width=True)
+        else:
+            h1.info("Aucun rendement dans la plage sélectionnée.")
+
+        fig_cov = build_dividend_universe_histogram(
+            hist_cov,
+            title="Répartition des ratios de couverture",
+            xaxis_title="Ratio de couverture (×)",
+            tickformat=".2f",
+        )
+        if fig_cov is not None:
+            h2.plotly_chart(fig_cov, use_container_width=True)
+        else:
+            h2.info("Aucun ratio de couverture dans la plage sélectionnée.")
+
+        fig_scatter = build_dividend_yield_coverage_scatter(
+            filtered_df,
+            title="Rendement vs ratio de couverture",
+        )
+        if fig_scatter is not None:
+            st.plotly_chart(fig_scatter, use_container_width=True)
+            st.caption(
+                "Chaque point = une action. Trait rouge = médiane du rendement · "
+                "trait vert = médiane de la couverture · couleur = niveau de couverture."
+            )
+        else:
+            st.info(
+                "Nuage rendement / couverture indisponible "
+                "(données manquantes dans la plage sélectionnée)."
+            )
+
+        st.caption(
+            f"**{len(filtered_df)}** titre(s) après filtres rendement / couverture / fréquence "
+            f"(sur {dividend_base_count} avec dividendes)."
+        )
+        full_df = filtered_df
+    else:
+        full_df = chart_base
 
     search = st.text_input("Filtrer par société ou ticker")
     if search.strip():
@@ -1547,7 +2418,13 @@ def _render_dividend_universe_section(portfolio_tickers=None):
         height=min(420, 80 + 35 * max(len(df_display), 1)),
     )
 
-    csv_bytes = df_display.to_csv(index=False).encode("utf-8")
+    csv_cols = ["Ticker"] + [c for c in show_cols if c in full_df.columns]
+    df_export = (
+        full_df[csv_cols]
+        .sort_values("Rendement (%)", ascending=False, na_position="last")
+        .drop_duplicates(subset=["Ticker"], keep="last")
+    )
+    csv_bytes = df_export.to_csv(index=False).encode("utf-8")
     st.download_button(
         "Télécharger l'univers (CSV)",
         csv_bytes,
@@ -1555,16 +2432,16 @@ def _render_dividend_universe_section(portfolio_tickers=None):
     )
 
 
-@st.fragment
 def render_dividendes_dashboard(prices, returns):
-    st.subheader("Dividendes & Qualité")
+    """Analyse dividendes du portefeuille / watchlist (nécessite les cours)."""
+    st.subheader("Dividendes & Qualité — portefeuille")
     _render_dividend_legend()
     tickers = [str(t).strip() for t in prices.columns]
+    _render_portfolio_dividend_analysis(prices, returns, tickers)
 
-    with st.expander("Univers dividendes — tickers.json (5000 actions)", expanded=False):
-        _render_dividend_universe_section(portfolio_tickers=tickers)
 
-    st.markdown("---")
+@st.fragment
+def _render_portfolio_dividend_analysis(prices, returns, tickers):
     last_prices = prices.iloc[-1]
     ticker_signature = "|".join(tickers)
     cache_key = f"data_divs_{abs(hash(ticker_signature))}"
@@ -1584,7 +2461,7 @@ def render_dividendes_dashboard(prices, returns):
     tickers_to_analyze = tickers
 
     if use_batches:
-        max_default = min(50, len(tickers))
+        max_default = min(150, len(tickers))
         max_to_analyze = st.slider(
             "Nombre max de tickers à analyser",
             min_value=10,
@@ -1592,36 +2469,44 @@ def render_dividendes_dashboard(prices, returns):
             value=min(max_default, len(tickers)),
             step=10,
         )
-        batch_options = [b for b in [25, 50, 75, 100] if b <= max(len(tickers), 1)]
+        batch_options = [b for b in [50, 100, 150, 200, 250] if b <= max(len(tickers), 1)]
         if not batch_options:
             batch_options = [len(tickers)]
-        default_batch_idx = 1 if len(batch_options) > 1 else 0
-        batch_size = st.selectbox("Taille de lot", batch_options, index=default_batch_idx)
+        default_batch_idx = next(
+            (i for i, b in enumerate(batch_options) if b >= 100),
+            len(batch_options) - 1,
+        )
+        portfolio_batch_size = st.selectbox(
+            "Taille de lot",
+            batch_options,
+            index=default_batch_idx,
+            key="div_portfolio_batch_size",
+        )
         limited = tickers[:max_to_analyze]
-        total_batches = max(1, int(np.ceil(len(limited) / batch_size)))
+        total_batches = max(1, int(np.ceil(len(limited) / portfolio_batch_size)))
         batch_key = f"{cache_key}_batch"
         if batch_key not in st.session_state:
             st.session_state[batch_key] = 0
         st.session_state[batch_key] = min(st.session_state[batch_key], total_batches - 1)
         batch_idx = st.session_state[batch_key]
-        start_i = batch_idx * batch_size
-        end_i = min(start_i + batch_size, len(limited))
+        start_i = batch_idx * portfolio_batch_size
+        end_i = min(start_i + portfolio_batch_size, len(limited))
         tickers_to_analyze = limited[start_i:end_i]
         st.caption(
             f"Lot {batch_idx + 1}/{total_batches} — tickers {start_i + 1} à {end_i} "
             f"sur {len(limited)}."
         )
         c1, c2, c3 = st.columns(3)
-        analyze_clicked = c1.button("Analyser ce lot")
-        next_clicked = c2.button("Lot suivant")
-        reset_clicked = c3.button("Recommencer")
+        analyze_clicked = c1.button("Analyser ce lot", key="div_portfolio_analyze_batch")
+        next_clicked = c2.button("Lot suivant", key="div_portfolio_next_batch")
+        reset_clicked = c3.button("Recommencer", key="div_portfolio_reset_batch")
         if next_clicked and batch_idx < total_batches - 1:
             st.session_state[batch_key] = batch_idx + 1
             st.rerun()
     else:
-        analyze_clicked = st.button("Analyser le portefeuille", type="primary")
+        analyze_clicked = st.button("Analyser le portefeuille", type="primary", key="div_portfolio_analyze_all")
         next_clicked = False
-        reset_clicked = st.button("Vider le cache dividendes")
+        reset_clicked = st.button("Vider le cache dividendes", key="div_portfolio_reset_cache")
         st.caption(f"{len(tickers)} ticker(s) — analyse directe sans lot.")
 
     if reset_clicked:
@@ -1644,23 +2529,27 @@ def render_dividendes_dashboard(prices, returns):
         st.rerun()
 
     if analyze_clicked and tickers_to_analyze:
-        rows, source_counts = _analyze_ticker_list(
-            tickers_to_analyze,
-            last_prices,
-            st.session_state[cache_key],
-            ticker_signature=ticker_signature,
-        )
-        st.session_state[cache_key] = rows
-        save_dividends_rows_to_disk(ticker_signature, rows)
-        st.caption(f"💾 Résultats enregistrés localement : `{_dividends_cache_path()}`")
-        st.info(
-            "Lot terminé — "
-            f"YahooQuery: {source_counts['YahooQuery']}, "
-            f"yfinance: {source_counts['yfinance']}, "
-            f"Boursorama: {source_counts['Boursorama']}, "
-            f"L'Echo: {source_counts['LEcho']}, "
-            f"échecs: {source_counts['Echecs']}"
-        )
+        try:
+            with st.spinner(f"Analyse de {len(tickers_to_analyze)} ticker(s)…"):
+                rows, source_counts = _analyze_ticker_list(
+                    tickers_to_analyze,
+                    last_prices,
+                    st.session_state[cache_key],
+                    ticker_signature=ticker_signature,
+                )
+            st.session_state[cache_key] = rows
+            save_dividends_rows_to_disk(ticker_signature, rows)
+            st.caption(f"💾 Résultats enregistrés localement : `{_dividends_cache_path()}`")
+            st.info(
+                "Lot terminé — "
+                f"YahooQuery: {source_counts['YahooQuery']}, "
+                f"yfinance: {source_counts['yfinance']}, "
+                f"Boursorama: {source_counts['Boursorama']}, "
+                f"L'Echo: {source_counts['LEcho']}, "
+                f"échecs: {source_counts['Echecs']}"
+            )
+        except Exception as exc:
+            st.error(f"Erreur lors de l'analyse dividendes : {exc}")
 
     rows = st.session_state[cache_key]
     if not rows:
@@ -1726,19 +2615,16 @@ def render_dividendes_dashboard(prices, returns):
     st.download_button("Télécharger le rapport (CSV)", csv, "dividendes.csv")
 
     st.write("---")
-    fig = px.scatter(
+    fig = build_dividend_yield_score_scatter(
         df,
-        x="Rendement",
-        y="Score",
-        text="Société",
-        size="Score",
-        color="Score",
-        color_continuous_scale="RdYlGn",
-        title="Analyse Risque / Qualité : Rendement vs Score Global",
-        hover_data={"Ticker": True, "Marché": True, "Devise": True},
+        title="Analyse risque / qualité : rendement vs score global",
     )
-    fig.update_traces(textposition="top center")
-    st.plotly_chart(fig, use_container_width=True)
+    if fig is not None:
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(
+            "Survolez un point pour le **nom**, le **ticker** et le **marché**. "
+            "Taille ∝ score · pas de libellés superposés."
+        )
 
     st.write("---")
     label_map = dict(zip(df["Ticker"], df["Société"]))

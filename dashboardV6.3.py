@@ -12,21 +12,46 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
+import suggestions_job
 from analytics import (
     build_portfolio_value,
+    build_portfolio_weight_pct_history,
+    build_portfolio_weight_history_chart,
+    build_portfolio_allocation_treemap,
+    build_portfolio_allocation_pie_figure,
+    build_portfolio_drawdown_figure,
+    build_risk_return_scatter_figure,
+    build_returns_distribution_var_figure,
+    build_suggestions_tradeoff_scatter,
+    build_technical_overview_figure,
+    build_technical_stochastic_figure,
+    build_technical_macd_figure,
     build_portfolio_price_for_fft,
     build_mean_median_mode_pedagogy_chart,
     build_fft_spectral_acf_chart,
     interpret_fft_acf_reading,
     build_fft_cyclic_chart,
+    compute_fft_model_correlations,
+    summarize_fft_trend_quality,
+    interpret_fft_trend_r2,
+    format_fft_rmse_display,
     FFT_TREND_OPTIONS,
     FFT_TREND_LOG_LINEAR,
+    FFT_RECON_OPTIONS,
+    FFT_RECON_FFT,
+    FFT_PRICE_UNIT_EUR,
+    FFT_PRICE_UNIT_PORTFOLIO,
+    FFT_PRICE_UNIT_INDEX,
     fft_trend_mode_label,
+    fft_recon_mode_label,
     build_risk_returns_boxplot,
     build_risk_metrics_boxplot,
+    build_correlation_heatmap_figure,
+    cluster_correlation_order,
     compute_bollinger,
     compute_fibonacci_levels,
     compute_linear_regression_channel,
+    build_regression_channel_figure,
     compute_macd,
     build_markowitz_assets_figure,
     compute_holdings_weights,
@@ -53,15 +78,16 @@ from analytics import (
     interpret_regression_channel_comment,
     interpret_rsi_comment,
     interpret_stochastic_comment,
+    interpret_supertrend_comment,
     interpret_support_resistance_comment,
     interpret_volume_comment,
     describe_suggestion_profile,
     compute_profile_scores,
     DEFAULT_SUGGESTION_OBJECTIVE_WEIGHTS,
     filter_suggestions_by_statistics,
-    enrich_suggestions_with_technical,
     filter_suggestions_by_technical,
     style_suggestions_technical,
+    style_technical_table,
     SUGGESTION_TECHNICAL_COLUMNS,
 )
 
@@ -81,16 +107,17 @@ from data_loader import (
 )
 from dashboard_cache import (
     cached_usd_to_eur_rate,
+    cached_usd_to_eur_series,
+    cached_compute_returns,
     cached_technical_indicators,
     cached_advanced_risk_metrics,
     cached_corr_matrix,
     cached_markowitz_weights,
     cached_markowitz_frontier_figure,
-    cached_fft_periodicity,
+    cached_fft_periodicity_ticker,
+    cached_fft_periodicity_portfolio,
     cached_fft_summary,
-    cached_suggest_portfolio_additions,
     cached_benchmark_prices,
-    cached_candidate_market_data,
     cached_technical_detail_bundle,
     clear_dashboard_compute_cache,
 )
@@ -171,8 +198,16 @@ def is_usd_ticker(ticker):
     return False
 
 
-def _render_fft_headline_metrics(result, peaks):
-    """Bandeau : cycle dominant, force du cycle et R² de la tendance retirée."""
+def _render_fft_headline_metrics(
+    result,
+    peaks,
+    n_components=3,
+    price_unit=FFT_PRICE_UNIT_EUR,
+    recon_mode=FFT_RECON_FFT,
+    recency_weighted=True,
+    recency_calibrate=True,
+):
+    """Bandeau : cycles, R² tendance et corrélations cours / modèle."""
     c1, c2, c3, c4 = st.columns(4)
     if peaks is not None and len(peaks):
         c1.metric(
@@ -199,16 +234,152 @@ def _render_fft_headline_metrics(result, peaks):
 
     r2 = result.get("trend_r2") if result else None
     rmse = result.get("trend_rmse") if result else None
+    rmse_pct = result.get("trend_rmse_pct") if result else None
     if r2 is not None and not (isinstance(r2, float) and np.isnan(r2)):
+        reliability = interpret_fft_trend_r2(r2)
+        abs_rmse, pct_rmse = format_fft_rmse_display(rmse, rmse_pct, price_unit)
         r2_help = (
-            "Qualité de la tendance retirée avant FFT, mesurée sur le prix réel (€). "
-            "1 = parfait · > 0,85 = bon · < 0,5 = tendance mal isolée."
+            "Qualité de la tendance retirée avant FFT, mesurée sur le prix réel. "
+            "R² = part de la variance du cours expliquée par la tendance seule. "
+            "1 = parfait · ≥ 0,85 = excellente · 0,65–0,85 = bonne · "
+            "0,50–0,65 = modérée · 0,30–0,50 = faible · < 0,30 = très faible."
         )
-        if rmse is not None and not np.isnan(rmse):
-            r2_help += f" RMSE = {rmse:,.2f} (écart moyen prix vs tendance)."
-        c4.metric("R² tendance", f"{r2:.3f}", help=r2_help)
+        if abs_rmse != "—":
+            r2_help += f" RMSE = {abs_rmse}"
+            if pct_rmse != "—":
+                r2_help += f" ({pct_rmse} du prix moyen)."
+        r2_help += f" {reliability['detail']}"
+        c4.metric(
+            "R² tendance",
+            f"{r2:.3f}",
+            delta=f"Fiabilité {reliability['label'].lower()}",
+            delta_color="off",
+            help=r2_help,
+        )
     else:
         c4.metric("R² tendance", "—", help="Non calculable sur cette série.")
+
+    peak_df = result.get("peaks") if result else None
+    if peak_df is not None and len(peak_df):
+        indices = peak_df.head(n_components)["_freq_idx"].tolist()
+        corrs = compute_fft_model_correlations(
+            result,
+            indices,
+            n_components=n_components,
+            recency_weighted=recency_weighted,
+            recency_calibrate=recency_calibrate,
+        )
+    else:
+        corrs = None
+
+    has_smooth = result is not None and result.get("smooth_prices") is not None
+    smooth_label = "MM41" if result and result.get("trend_mode", "").startswith("ma41") else "lissage"
+
+    c5, c6, c7, c8 = st.columns(4)
+    if corrs:
+        r_fft = corrs.get("corr_with_trend_filter")
+        r_harm = corrs.get("corr_harmonic")
+        r_smooth = corrs.get("corr_vs_smooth")
+        r_harm_smooth = corrs.get("corr_harmonic_vs_smooth")
+
+        if r_fft is not None and not np.isnan(r_fft):
+            c5.metric(
+                "Corr. modèle FFT vs cours",
+                f"{r_fft:.3f}",
+                help=(
+                    "Corrélation de Pearson entre le cours réel et le modèle "
+                    "tendance + cycles (pics FFT), sur l'historique."
+                ),
+            )
+        else:
+            c5.metric("Corr. modèle FFT vs cours", "—")
+
+        if r_harm is not None and not np.isnan(r_harm):
+            c6.metric(
+                "Corr. harmonique vs cours",
+                f"{r_harm:.3f}",
+                help=(
+                    "Corrélation entre le cours et une régression sin/cos "
+                    "aux périodes dominantes détectées par FFT."
+                ),
+            )
+        else:
+            c6.metric("Corr. harmonique vs cours", "—")
+
+        if has_smooth and r_smooth is not None and not np.isnan(r_smooth):
+            c7.metric(
+                f"Corr. FFT vs {smooth_label}",
+                f"{r_smooth:.3f}",
+                help=(
+                    f"Fidélité du modèle FFT à la série lissée ({smooth_label}), "
+                    "sans le bruit haute fréquence du cours brut."
+                ),
+            )
+        elif has_smooth and r_harm_smooth is not None and not np.isnan(r_harm_smooth):
+            c7.metric(
+                f"Corr. harmonique vs {smooth_label}",
+                f"{r_harm_smooth:.3f}",
+                help=f"Qualité de l'ajustement harmonique sur la série {smooth_label}.",
+            )
+        else:
+            r_without = corrs.get("corr_without_trend_filter")
+            if r_without is not None and not np.isnan(r_without):
+                c7.metric(
+                    "Corr. FFT sans dé-trend",
+                    f"{r_without:.3f}",
+                    help="FFT sur log(prix) sans retirer la tendance (comparaison).",
+                )
+            else:
+                c7.metric("Corr. vs lissage", "—")
+
+        if has_smooth and r_harm_smooth is not None and not np.isnan(r_harm_smooth):
+            c8.metric(
+                f"Harmonique vs {smooth_label}",
+                f"{r_harm_smooth:.3f}",
+                help="Régression harmonique comparée à la série lissée.",
+            )
+        else:
+            c8.metric("Méthode graphique", fft_recon_mode_label(recon_mode))
+    else:
+        c5.metric("Corr. modèle FFT vs cours", "—")
+        c6.metric("Corr. harmonique vs cours", "—")
+        c7.metric("Corr. vs lissage", "—")
+        c8.metric("Méthode graphique", "—")
+
+
+def _suggestion_range_filter(
+    container,
+    label,
+    min_value,
+    max_value,
+    default_range,
+    step,
+    *,
+    key_prefix,
+    help=None,
+    scale=1.0,
+):
+    """Case à cocher + curseur double borne ; retourne (min, max) ou (None, None)."""
+    with container:
+        active = st.checkbox(
+            f"Filtrer {label}",
+            value=False,
+            key=f"{key_prefix}_use",
+            help=help,
+        )
+        if not active:
+            return None, None
+        lo, hi = st.slider(
+            f"Plage {label}",
+            min_value=min_value,
+            max_value=max_value,
+            value=default_range,
+            step=step,
+            key=f"{key_prefix}_range",
+        )
+        if scale != 1.0:
+            return lo * scale, hi * scale
+        return lo, hi
 
 
 def _objective_weight_slider(label, low_hint, high_hint, default, key, tech_name=None):
@@ -249,7 +420,8 @@ mode_selection = st.sidebar.radio(
 )
 
 start_date = st.sidebar.date_input(
-    "Date de début des historiques", pd.to_datetime("2020-01-01")
+    "Date de début des historiques",
+    (pd.Timestamp.today().normalize() - pd.DateOffset(years=1)).date(),
 )
 if mode_selection == "👁 Mes Watchlists":
     st.sidebar.caption(
@@ -468,13 +640,455 @@ refresh_interval = st.sidebar.slider(
 )
 if st.sidebar.button("Vider le cache des cours", help="Force un rechargement complet au prochain affichage"):
     if liste_tickers:
-        clear_market_cache(_tickers_signature(liste_tickers, start_date))
+        clear_market_cache(
+            _tickers_signature(liste_tickers, start_date),
+            tickers=liste_tickers,
+            start=start_date,
+        )
     else:
         clear_market_cache()
     clear_dashboard_compute_cache()
     st.session_state.pop("ohlcv_sig", None)
     st.sidebar.success("Cache cours vidé.")
 run_every = refresh_interval if auto_refresh_enabled and liste_tickers else None
+
+
+@st.fragment
+def _render_synthese_plus_values(prices, returns, ohlcv_sig):
+    if mode_portfolio_actif:
+        st.header("💼 Valorisation & Performance du Portefeuille (Converti en EUR)")
+
+        with st.spinner("Mise à jour du taux de change EUR/USD..."):
+            usd_to_eur = cached_usd_to_eur_rate()
+
+        last_prices = prices.iloc[-1]
+        synthese_rows = []
+        total_valeur_actuelle = 0.0
+        total_cout_achat = 0.0
+        tickers_sans_cours = []
+        quantities = {}
+
+        for tk in liste_tickers:
+            if tk not in last_prices or pd.isna(last_prices[tk]):
+                tickers_sans_cours.append(tk)
+                continue
+
+            q = portefeuille_dict[tk]["Quantite"]
+            pru_devise = portefeuille_dict[tk]["PRU"]
+            current_p_devise = float(last_prices[tk])
+            quantities[tk] = q
+
+            if is_usd_ticker(tk):
+                taux = usd_to_eur
+                devise_origine = "$"
+            else:
+                taux = 1.0
+                devise_origine = "€"
+
+            pru_eur = pru_devise * taux
+            current_p_eur = current_p_devise * taux
+            cout_eur = q * pru_eur
+            valeur_eur = q * current_p_eur
+            pvh_eur = valeur_eur - cout_eur
+            pvh_pct = (pvh_eur / cout_eur) if cout_eur > 0 else 0.0
+
+            total_valeur_actuelle += valeur_eur
+            total_cout_achat += cout_eur
+
+            synthese_rows.append(
+                {
+                    "Ticker": tk,
+                    "Quantité": q,
+                    "PRU (Origine)": f"{pru_devise:.2f} {devise_origine}",
+                    "PRU (€)": pru_eur,
+                    "Cours (€)": current_p_eur,
+                    "Coût d'Achat (€)": cout_eur,
+                    "Valeur Actuelle (€)": valeur_eur,
+                    "Plus/Moins-Value (€)": pvh_eur,
+                    "Perf (%)": pvh_pct,
+                }
+            )
+
+        if tickers_sans_cours:
+            st.error(
+                "Positions sans cours disponible : "
+                + ", ".join(tickers_sans_cours)
+            )
+
+        if synthese_rows:
+            df_synthese = pd.DataFrame(synthese_rows)
+            df_synthese = add_company_names(
+                df_synthese, ticker_names, show_names=show_company_names, sectors=ticker_sectors
+            )
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Valeur Totale (EUR)", f"{total_valeur_actuelle:,.2f} €")
+            c2.metric("Coût d'Achat Total (EUR)", f"{total_cout_achat:,.2f} €")
+            tot_pvh = total_valeur_actuelle - total_cout_achat
+            tot_pvh_pct = (
+                (tot_pvh / total_cout_achat) if total_cout_achat > 0 else 0.0
+            )
+            c3.metric(
+                "Plus-Value Globale (EUR)",
+                f"{tot_pvh:,.2f} €",
+                f"{tot_pvh_pct:.2%}",
+            )
+
+            st.write("---")
+            st.caption(
+                "Montants en **€** (conversion USD→EUR si applicable). **Perf (%)** = plus-value relative."
+            )
+            st.dataframe(
+                df_synthese.style.format(
+                    {
+                        "PRU (€)": "{:.2f} €",
+                        "Cours (€)": "{:.2f} €",
+                        "Coût d'Achat (€)": "{:.2f} €",
+                        "Valeur Actuelle (€)": "{:.2f} €",
+                        "Plus/Moins-Value (€)": "{:.2f} €",
+                        "Perf (%)": "{:.2%}",
+                    }
+                ).background_gradient(
+                    cmap="RdYlGn", subset=["Plus/Moins-Value (€)"]
+                )
+            )
+
+            st.markdown("### Répartition du capital")
+            alloc_mode = st.radio(
+                "Vue allocation",
+                options=["Treemap (secteurs)", "Donut"],
+                horizontal=True,
+                key="synth_alloc_mode",
+                label_visibility="collapsed",
+            )
+            if alloc_mode.startswith("Treemap"):
+                fig_alloc = build_portfolio_allocation_treemap(
+                    df_synthese,
+                    label_col="Nom" if show_company_names and "Nom" in df_synthese.columns else "Ticker",
+                )
+            else:
+                fig_alloc = build_portfolio_allocation_pie_figure(
+                    df_synthese,
+                    label_col="Nom" if show_company_names and "Nom" in df_synthese.columns else "Ticker",
+                )
+            if fig_alloc is not None:
+                st.plotly_chart(fig_alloc, use_container_width=True)
+            st.caption(
+                "**Treemap** : hiérarchie par secteur si disponible · **Donut** : vue circulaire classique."
+            )
+
+            fx_hist = cached_usd_to_eur_series(str(start_date))
+            weight_hist = build_portfolio_weight_pct_history(
+                prices,
+                quantities,
+                usd_to_eur_series=fx_hist,
+                usd_to_eur=usd_to_eur,
+                is_usd_fn=is_usd_ticker,
+            )
+            st.markdown("### Évolution des poids dans le portefeuille")
+            if weight_hist.empty or len(weight_hist) < 2:
+                st.info(
+                    "Historique insuffisant pour afficher l'évolution des poids "
+                    "(vérifiez la date de début et les cours disponibles)."
+                )
+            else:
+                weight_labels = {
+                    row["Ticker"]: (
+                        row["Nom"]
+                        if show_company_names and "Nom" in row and row["Nom"]
+                        else row["Ticker"]
+                    )
+                    for _, row in df_synthese.iterrows()
+                }
+                fig_weights = build_portfolio_weight_history_chart(
+                    weight_hist,
+                    labels=weight_labels,
+                    title="Répartition du capital par titre (%)",
+                )
+                if fig_weights is not None:
+                    st.plotly_chart(fig_weights, use_container_width=True)
+                st.caption(
+                    "Part de chaque ligne en **%** de la valorisation totale (€), "
+                    "recalculée chaque jour. Titres en **USD** : conversion au "
+                    "**taux EUR/USD historique** du jour (pas le taux actuel). "
+                    "Quantités = positions actuelles du CSV (vue rétrospective)."
+                )
+
+            port_value = build_portfolio_value(
+                prices, quantities, usd_to_eur=usd_to_eur, is_usd_fn=is_usd_ticker
+            )
+            if port_value is not None and len(port_value.dropna()) >= 2:
+                st.markdown("### Drawdown du portefeuille")
+                fig_dd = build_portfolio_drawdown_figure(
+                    port_value,
+                    title="Baisse depuis le dernier pic (valorisation €)",
+                )
+                if fig_dd is not None:
+                    st.plotly_chart(fig_dd, use_container_width=True)
+                st.caption(
+                    "Drawdown = **(valeur − pic cumulé) / pic**. "
+                    "Mesure la baisse maximale vécue sur la période."
+                )
+
+            port_risk = compute_portfolio_risk_metrics(port_value)
+            if port_risk is not None and len(port_value) >= 2:
+                rendement_periode = port_value.iloc[-1] / port_value.iloc[0] - 1
+                port_tickers_risk = [
+                    t for t in liste_tickers if t in returns.columns and quantities.get(t, 0) > 0
+                ]
+                internal_corr = compute_avg_internal_correlation(
+                    returns, port_tickers_risk
+                )
+
+                profile_title, profile_desc, pseudo_weights, profile_scores = (
+                    describe_portfolio_profile(
+                        port_risk,
+                        internal_corr=internal_corr,
+                    )
+                )
+
+                st.markdown("### Profil de votre portefeuille")
+                st.markdown(f"**{profile_title}**")
+                st.caption(profile_desc)
+                with st.expander(
+                    "📖 Légende — comment lire le profil du portefeuille ?",
+                    expanded=False,
+                ):
+                    st.markdown(
+                        """
+Le profil est déduit de **vos métriques réelles** (rendement, volatilité, skewness,
+kurtosis, corrélation entre vos lignes) — pas de vos curseurs dans « Suggestions d'actifs ».
+
+| Dimension observée | Ce qu'elle indique |
+|--------------------|-------------------|
+| **Rendement annuel** | Performance moyenne journalière annualisée (├ù 252). |
+| **Volatilité** | Ampleur des variations quotidiennes. Faible = portefeuille calme. |
+| **Skewness** | Asymétrie des rendements. **> 0** = journées de forte hausse plus fréquentes. |
+| **Kurtosis** | Risque d'événements extrêmes. **Élevé** = queues épaisses (grosses secousses). |
+| **Corrélation interne** | Les titres montent-ils **ensemble** ? **Faible** = meilleure diversification. |
+
+Les libellés (Prudent, Dynamique, Diversificateur…) sont les **mêmes** que dans
+« Suggestions d'actifs », mais ici ils décrivent **ce que votre portefeuille a fait**
+sur la période sélectionnée.
+                        """
+                    )
+                with st.expander("Détail du profil (scores & traduction)", expanded=False):
+                    st.caption(
+                        "Les métriques sont converties en pseudo-poids (0–2), puis scores "
+                        "de profil — m├¬me moteur que les suggestions d'actifs."
+                    )
+                    c_m1, c_m2 = st.columns(2)
+                    with c_m1:
+                        st.markdown("**Métriques observées**")
+                        metrics_view = pd.DataFrame(
+                            [
+                                {
+                                    "Indicateur": "Rendement annuel (moy.)",
+                                    "Valeur": f"{port_risk['Rendement Annuel (moyenne)']:.2%}",
+                                },
+                                {
+                                    "Indicateur": "Volatilité",
+                                    "Valeur": f"{port_risk['Volatilité (Sigma)']:.2%}",
+                                },
+                                {
+                                    "Indicateur": "Skewness",
+                                    "Valeur": f"{port_risk['Skewness (Asymétrie)']:.2f}",
+                                },
+                                {
+                                    "Indicateur": "Kurtosis",
+                                    "Valeur": f"{port_risk['Kurtosis (Aplatissement)']:.2f}",
+                                },
+                                {
+                                    "Indicateur": "Corr. interne moy.",
+                                    "Valeur": (
+                                        f"{internal_corr:.2f}"
+                                        if not np.isnan(internal_corr)
+                                        else "—"
+                                    ),
+                                },
+                            ]
+                        )
+                        st.dataframe(metrics_view, hide_index=True, use_container_width=True)
+                    with c_m2:
+                        st.markdown("**Pseudo-poids dérivés (0–2)**")
+                        st.write(
+                            pd.Series(
+                                {
+                                    "rendement ↑": pseudo_weights["return"],
+                                    "volatilité ↓": pseudo_weights["vol"],
+                                    "kurtosis ↓": pseudo_weights["kurt"],
+                                    "skewness ↑": pseudo_weights["skew"],
+                                    "corrélation interne ↓": pseudo_weights[
+                                        "corr_internal"
+                                    ],
+                                }
+                            ).map(lambda x: f"{x:.2f}")
+                        )
+                    score_df = pd.DataFrame(
+                        [
+                            {"Profil": name, "Score": score}
+                            for name, score in sorted(
+                                profile_scores.items(),
+                                key=lambda item: -item[1],
+                            )
+                        ]
+                    )
+                    st.dataframe(
+                        score_df.style.format({"Score": "{:.0%}"}),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+                    if " ┬À " in profile_title:
+                        st.caption(
+                            "Deux profils affichés car le portefeuille combine "
+                            "plusieurs caractéristiques marquées."
+                        )
+                st.markdown("### Métriques de risque du portefeuille")
+                st.caption(
+                    f"Calculées sur la période sélectionnée ({start_date} → aujourd'hui), "
+                    "à partir de la valorisation quotidienne en €. "
+                    "Moyenne, médiane et mode des rendements journaliers (annualisés) "
+                    "aident à lire la skewness : asymétrie droite si moyenne > médiane > mode."
+                )
+                c1, c2, c3, c4, c5, c6 = st.columns(6)
+                c1.metric("Rendement (période)", f"{rendement_periode:.2%}")
+                c2.metric("Moyenne annuelle", f"{port_risk['Rendement Annuel (moyenne)']:.2%}")
+                c3.metric("Médiane annuelle", f"{port_risk['Médiane annuelle']:.2%}")
+                c4.metric("Mode annuelle", f"{port_risk['Mode annuelle']:.2%}")
+                c5.metric("Skewness", f"{port_risk['Skewness (Asymétrie)']:.2f}")
+                c6.metric("Volatilité annuelle", f"{port_risk['Volatilité (Sigma)']:.2%}")
+                c7, c8 = st.columns(2)
+                c7.metric("Ratio de Sharpe", f"{port_risk['Ratio de Sharpe']:.2f}")
+                c8.metric("Kurtosis", f"{port_risk['Kurtosis (Aplatissement)']:.2f}")
+
+                st.markdown("### Performance vs indice de référence")
+
+                @st.fragment
+                def _benchmark_comparison():
+                    bench_label = st.selectbox(
+                        "Indice de comparaison",
+                        list(BENCHMARKS.keys()),
+                        index=0,
+                        key="synth_bench_label",
+                    )
+                    bench_ticker = BENCHMARKS[bench_label]
+                    try:
+                        bench_prices = cached_benchmark_prices(
+                            bench_ticker, str(start_date)
+                        )
+                        if not bench_prices.empty and bench_ticker in bench_prices.columns:
+                            bench_series = bench_prices[bench_ticker].dropna()
+                            common_idx = port_value.index.intersection(bench_series.index)
+                            if len(common_idx) >= 2:
+                                port_norm = port_value.loc[common_idx]
+                                bench_norm = bench_series.loc[common_idx]
+                                port_base100 = port_norm / port_norm.iloc[0] * 100
+                                bench_base100 = bench_norm / bench_norm.iloc[0] * 100
+                                perf_port = port_base100.iloc[-1] / 100 - 1
+                                perf_bench = bench_base100.iloc[-1] / 100 - 1
+                                alpha = perf_port - perf_bench
+
+                                m1, m2, m3 = st.columns(3)
+                                m1.metric("Perf. portefeuille", f"{perf_port:.2%}")
+                                m2.metric(f"Perf. {bench_label}", f"{perf_bench:.2%}")
+                                m3.metric("Écart (alpha)", f"{alpha:.2%}")
+
+                                fig_bench = go.Figure()
+                                fig_bench.add_trace(
+                                    go.Scatter(
+                                        x=port_base100.index,
+                                        y=port_base100.values,
+                                        mode="lines",
+                                        name="Portefeuille",
+                                    )
+                                )
+                                fig_bench.add_trace(
+                                    go.Scatter(
+                                        x=bench_base100.index,
+                                        y=bench_base100.values,
+                                        mode="lines",
+                                        name=bench_label,
+                                    )
+                                )
+                                fig_bench.update_layout(
+                                    title=f"Portefeuille vs {bench_label} (base 100)",
+                                    yaxis_title="Base 100",
+                                )
+                                st.plotly_chart(fig_bench, use_container_width=True)
+                            else:
+                                st.info("Pas assez de dates communes pour la comparaison.")
+                        else:
+                            st.warning(f"Impossible de charger l'indice {bench_label}.")
+                    except Exception as e:
+                        st.warning(f"Comparaison benchmark indisponible : {e}")
+
+                _benchmark_comparison()
+
+                st.markdown("### Tendance & canal σ — valorisation portefeuille")
+                port_val_clean = port_value.dropna() if port_value is not None else pd.Series(dtype=float)
+                if len(port_val_clean) >= 10:
+                    fig_reg = build_regression_channel_figure(
+                        port_val_clean,
+                        scale="log",
+                        title="Valorisation portefeuille — régression log & bandes ±1σ / ±2σ",
+                        series_name="Portefeuille (€)",
+                        yaxis_title="Valorisation (€)",
+                    )
+                    if fig_reg is not None:
+                        st.plotly_chart(fig_reg, use_container_width=True)
+                    st.caption(
+                        "Échelle **logarithmique** : la droite bleue est une tendance de "
+                        "**croissance en %** (régression sur log(valorisation)). "
+                        "Pointillés = bandes parallèles à ±**1σ** et ±**2σ** "
+                        "(écarts relatifs autour de la tendance). Adapté aux portefeuilles "
+                        "dont la valeur évolue de façon composée dans le temps."
+                    )
+                else:
+                    st.info(
+                        "Canal de régression indisponible (minimum ~10 séances de valorisation)."
+                    )
+        elif not tickers_sans_cours:
+            st.warning("Aucune position valide à afficher.")
+    else:
+        st.header(f"📊 Aperçu des Derniers Cours de l'Indice : {indice_choisi}")
+        last_prices = prices.iloc[-1].reset_index()
+        last_prices.columns = ["Ticker", "Dernier Cours (Devise d'origine)"]
+        last_prices = add_company_names(
+            last_prices, ticker_names, show_names=show_company_names, sectors=ticker_sectors
+        )
+        st.dataframe(
+            last_prices.style.format(
+                {"Dernier Cours (Devise d'origine)": "{:.2f}"}
+            )
+        )
+
+def _resolve_ticker_metadata(
+    tickers,
+    base_names,
+    base_sectors,
+    *,
+    need_names=True,
+    need_sectors=False,
+):
+    """Réutilise les métadonnées déjà chargées ; ne fetch que les tickers manquants."""
+    tickers = [t for t in dict.fromkeys(tickers or []) if t]
+    names = dict(base_names or {})
+    sectors = dict(base_sectors or {})
+    missing = []
+    for t in tickers:
+        if need_names and t not in names:
+            missing.append(t)
+        elif need_sectors and t not in sectors:
+            missing.append(t)
+    missing = sorted(set(missing))
+    if missing:
+        extra_names, extra_sectors = get_ticker_metadata(
+            missing,
+            need_names=need_names,
+            need_sectors=need_sectors,
+        )
+        names.update(extra_names)
+        sectors.update(extra_sectors)
+    return names, sectors
 
 
 @st.fragment(run_every=run_every)
@@ -504,7 +1118,7 @@ def render_live_dashboard():
         try:
             ohlcv_sig = _tickers_signature(liste_tickers, start_date)
             if st.session_state.get("ohlcv_sig") != ohlcv_sig:
-                refresh_mode = "full"
+                refresh_mode = "auto"
                 st.session_state.ohlcv_sig = ohlcv_sig
             elif refresh_clicked:
                 refresh_mode = "incremental"
@@ -521,7 +1135,10 @@ def render_live_dashboard():
                     liste_tickers, start=start_date, refresh="full"
                 )
             if not prices.empty:
-                returns = compute_returns(prices)
+                tickers_tuple = tuple(sorted(liste_tickers))
+                returns = cached_compute_returns(ohlcv_sig, tickers_tuple, str(start_date))
+                if returns.empty:
+                    returns = compute_returns(prices)
                 missing_tickers = [t for t in liste_tickers if t not in prices.columns]
                 if missing_tickers:
                     st.warning(
@@ -533,6 +1150,28 @@ def render_live_dashboard():
             st.error(f"Erreur lors de la récupération des prix : {e}")
     else:
         st.warning("Aucun ticker sélectionné ou disponible.")
+
+    if suggestions_job.is_active():
+        _sugg_job = st.session_state.get("suggestions_job") or {}
+        _sugg_phase = _sugg_job.get("phase", "init")
+        if _sugg_phase == "core" and (prices.empty or returns.empty):
+            _sugg_job["status"] = "error"
+            _sugg_job["error"] = (
+                "Cours du portefeuille indisponibles — vérifiez les tickers et réessayez."
+            )
+            st.session_state["suggestions_job"] = _sugg_job
+        else:
+            _sugg_sig = ohlcv_sig or (
+                _tickers_signature(liste_tickers, start_date) if liste_tickers else ""
+            )
+            _sugg_returns = returns if not returns.empty else pd.DataFrame()
+            if suggestions_job.run_step(
+                returns=_sugg_returns,
+                ohlcv_sig=_sugg_sig,
+                has_fundamentals=HAS_FUNDAMENTALS,
+                has_dividendes=HAS_DIVIDENDES,
+            ):
+                st.rerun()
 
     if mode_watchlist_actif and vue == "Ma watchlist":
         if not liste_tickers:
@@ -552,341 +1191,73 @@ def render_live_dashboard():
             st.error("Module watchlists indisponible.")
 
     elif not prices.empty and not returns.empty:
+        tickers_tuple = tuple(sorted(liste_tickers))
+        start_date_str = str(start_date)
 
         if vue == "Synthèse & Plus-values":
-            if mode_portfolio_actif:
-                st.header("💼 Valorisation & Performance du Portefeuille (Converti en EUR)")
-
-                with st.spinner("Mise à jour du taux de change EUR/USD..."):
-                    usd_to_eur = cached_usd_to_eur_rate()
-
-                last_prices = prices.iloc[-1]
-                synthese_rows = []
-                total_valeur_actuelle = 0.0
-                total_cout_achat = 0.0
-                tickers_sans_cours = []
-                quantities = {}
-
-                for tk in liste_tickers:
-                    if tk not in last_prices or pd.isna(last_prices[tk]):
-                        tickers_sans_cours.append(tk)
-                        continue
-
-                    q = portefeuille_dict[tk]["Quantite"]
-                    pru_devise = portefeuille_dict[tk]["PRU"]
-                    current_p_devise = float(last_prices[tk])
-                    quantities[tk] = q
-
-                    if is_usd_ticker(tk):
-                        taux = usd_to_eur
-                        devise_origine = "$"
-                    else:
-                        taux = 1.0
-                        devise_origine = "€"
-
-                    pru_eur = pru_devise * taux
-                    current_p_eur = current_p_devise * taux
-                    cout_eur = q * pru_eur
-                    valeur_eur = q * current_p_eur
-                    pvh_eur = valeur_eur - cout_eur
-                    pvh_pct = (pvh_eur / cout_eur) if cout_eur > 0 else 0.0
-
-                    total_valeur_actuelle += valeur_eur
-                    total_cout_achat += cout_eur
-
-                    synthese_rows.append(
-                        {
-                            "Ticker": tk,
-                            "Quantité": q,
-                            "PRU (Origine)": f"{pru_devise:.2f} {devise_origine}",
-                            "PRU (€)": pru_eur,
-                            "Cours (€)": current_p_eur,
-                            "Coût d'Achat (€)": cout_eur,
-                            "Valeur Actuelle (€)": valeur_eur,
-                            "Plus/Moins-Value (€)": pvh_eur,
-                            "Perf (%)": pvh_pct,
-                        }
-                    )
-
-                if tickers_sans_cours:
-                    st.error(
-                        "Positions sans cours disponible : "
-                        + ", ".join(tickers_sans_cours)
-                    )
-
-                if synthese_rows:
-                    df_synthese = pd.DataFrame(synthese_rows)
-                    df_synthese = add_company_names(
-                        df_synthese, ticker_names, show_names=show_company_names, sectors=ticker_sectors
-                    )
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Valeur Totale (EUR)", f"{total_valeur_actuelle:,.2f} €")
-                    c2.metric("Coût d'Achat Total (EUR)", f"{total_cout_achat:,.2f} €")
-                    tot_pvh = total_valeur_actuelle - total_cout_achat
-                    tot_pvh_pct = (
-                        (tot_pvh / total_cout_achat) if total_cout_achat > 0 else 0.0
-                    )
-                    c3.metric(
-                        "Plus-Value Globale (EUR)",
-                        f"{tot_pvh:,.2f} €",
-                        f"{tot_pvh_pct:.2%}",
-                    )
-
-                    st.write("---")
-                    st.caption(
-                        "Montants en **€** (conversion USD→EUR si applicable). **Perf (%)** = plus-value relative."
-                    )
-                    st.dataframe(
-                        df_synthese.style.format(
-                            {
-                                "PRU (€)": "{:.2f} €",
-                                "Cours (€)": "{:.2f} €",
-                                "Coût d'Achat (€)": "{:.2f} €",
-                                "Valeur Actuelle (€)": "{:.2f} €",
-                                "Plus/Moins-Value (€)": "{:.2f} €",
-                                "Perf (%)": "{:.2%}",
-                            }
-                        ).background_gradient(
-                            cmap="RdYlGn", subset=["Plus/Moins-Value (€)"]
-                        )
-                    )
-
-                    fig_pie = px.pie(
-                        df_synthese,
-                        values="Valeur Actuelle (€)",
-                        names="Nom" if show_company_names and "Nom" in df_synthese.columns else "Ticker",
-                        title="Répartition réelle du Capital (€)",
-                    )
-                    st.plotly_chart(fig_pie, use_container_width=True)
-
-                    port_value = build_portfolio_value(
-                        prices, quantities, usd_to_eur=usd_to_eur, is_usd_fn=is_usd_ticker
-                    )
-                    port_risk = compute_portfolio_risk_metrics(port_value)
-                    if port_risk is not None and len(port_value) >= 2:
-                        rendement_periode = port_value.iloc[-1] / port_value.iloc[0] - 1
-                        port_tickers_risk = [
-                            t for t in liste_tickers if t in returns.columns and quantities.get(t, 0) > 0
-                        ]
-                        internal_corr = compute_avg_internal_correlation(
-                            returns, port_tickers_risk
-                        )
-
-                        profile_title, profile_desc, pseudo_weights, profile_scores = (
-                            describe_portfolio_profile(
-                                port_risk,
-                                internal_corr=internal_corr,
-                            )
-                        )
-
-                        st.markdown("### Profil de votre portefeuille")
-                        st.markdown(f"**{profile_title}**")
-                        st.caption(profile_desc)
-                        with st.expander(
-                            "📖 Légende — comment lire le profil du portefeuille ?",
-                            expanded=False,
-                        ):
-                            st.markdown(
-                                """
-Le profil est déduit de **vos métriques réelles** (rendement, volatilité, skewness,
-kurtosis, corrélation entre vos lignes) — pas de vos curseurs dans « Suggestions d'actifs ».
-
-| Dimension observée | Ce qu'elle indique |
-|--------------------|-------------------|
-| **Rendement annuel** | Performance moyenne journalière annualisée (× 252). |
-| **Volatilité** | Ampleur des variations quotidiennes. Faible = portefeuille calme. |
-| **Skewness** | Asymétrie des rendements. **> 0** = journées de forte hausse plus fréquentes. |
-| **Kurtosis** | Risque d'événements extrêmes. **Élevé** = queues épaisses (grosses secousses). |
-| **Corrélation interne** | Les titres montent-ils **ensemble** ? **Faible** = meilleure diversification. |
-
-Les libellés (Prudent, Dynamique, Diversificateur…) sont les **mêmes** que dans
-« Suggestions d'actifs », mais ici ils décrivent **ce que votre portefeuille a fait**
-sur la période sélectionnée.
-                                """
-                            )
-                        with st.expander("Détail du profil (scores & traduction)", expanded=False):
-                            st.caption(
-                                "Les métriques sont converties en pseudo-poids (0–2), puis scores "
-                                "de profil — même moteur que les suggestions d'actifs."
-                            )
-                            c_m1, c_m2 = st.columns(2)
-                            with c_m1:
-                                st.markdown("**Métriques observées**")
-                                metrics_view = pd.DataFrame(
-                                    [
-                                        {
-                                            "Indicateur": "Rendement annuel (moy.)",
-                                            "Valeur": f"{port_risk['Rendement Annuel (moyenne)']:.2%}",
-                                        },
-                                        {
-                                            "Indicateur": "Volatilité",
-                                            "Valeur": f"{port_risk['Volatilité (Sigma)']:.2%}",
-                                        },
-                                        {
-                                            "Indicateur": "Skewness",
-                                            "Valeur": f"{port_risk['Skewness (Asymétrie)']:.2f}",
-                                        },
-                                        {
-                                            "Indicateur": "Kurtosis",
-                                            "Valeur": f"{port_risk['Kurtosis (Aplatissement)']:.2f}",
-                                        },
-                                        {
-                                            "Indicateur": "Corr. interne moy.",
-                                            "Valeur": (
-                                                f"{internal_corr:.2f}"
-                                                if not np.isnan(internal_corr)
-                                                else "—"
-                                            ),
-                                        },
-                                    ]
-                                )
-                                st.dataframe(metrics_view, hide_index=True, use_container_width=True)
-                            with c_m2:
-                                st.markdown("**Pseudo-poids dérivés (0–2)**")
-                                st.write(
-                                    pd.Series(
-                                        {
-                                            "rendement ↑": pseudo_weights["return"],
-                                            "volatilité ↓": pseudo_weights["vol"],
-                                            "kurtosis ↓": pseudo_weights["kurt"],
-                                            "skewness ↑": pseudo_weights["skew"],
-                                            "corrélation interne ↓": pseudo_weights[
-                                                "corr_internal"
-                                            ],
-                                        }
-                                    ).map(lambda x: f"{x:.2f}")
-                                )
-                            score_df = pd.DataFrame(
-                                [
-                                    {"Profil": name, "Score": score}
-                                    for name, score in sorted(
-                                        profile_scores.items(),
-                                        key=lambda item: -item[1],
-                                    )
-                                ]
-                            )
-                            st.dataframe(
-                                score_df.style.format({"Score": "{:.0%}"}),
-                                hide_index=True,
-                                use_container_width=True,
-                            )
-                            if " · " in profile_title:
-                                st.caption(
-                                    "Deux profils affichés car le portefeuille combine "
-                                    "plusieurs caractéristiques marquées."
-                                )
-
-                        st.markdown("### Métriques de risque du portefeuille")
-                        st.caption(
-                            f"Calculées sur la période sélectionnée ({start_date} → aujourd'hui), "
-                            "à partir de la valorisation quotidienne en €. "
-                            "Moyenne, médiane et mode des rendements journaliers (annualisés) "
-                            "aident à lire la skewness : asymétrie droite si moyenne > médiane > mode."
-                        )
-                        c1, c2, c3, c4, c5, c6 = st.columns(6)
-                        c1.metric("Rendement (période)", f"{rendement_periode:.2%}")
-                        c2.metric("Moyenne annuelle", f"{port_risk['Rendement Annuel (moyenne)']:.2%}")
-                        c3.metric("Médiane annuelle", f"{port_risk['Médiane annuelle']:.2%}")
-                        c4.metric("Mode annuelle", f"{port_risk['Mode annuelle']:.2%}")
-                        c5.metric("Skewness", f"{port_risk['Skewness (Asymétrie)']:.2f}")
-                        c6.metric("Volatilité annuelle", f"{port_risk['Volatilité (Sigma)']:.2%}")
-                        c7, c8 = st.columns(2)
-                        c7.metric("Ratio de Sharpe", f"{port_risk['Ratio de Sharpe']:.2f}")
-                        c8.metric("Kurtosis", f"{port_risk['Kurtosis (Aplatissement)']:.2f}")
-
-                        st.markdown("### Performance vs indice de référence")
-
-                        @st.fragment
-                        def _benchmark_comparison():
-                            bench_label = st.selectbox(
-                                "Indice de comparaison",
-                                list(BENCHMARKS.keys()),
-                                index=0,
-                                key="synth_bench_label",
-                            )
-                            bench_ticker = BENCHMARKS[bench_label]
-                            try:
-                                bench_prices = cached_benchmark_prices(
-                                    bench_ticker, str(start_date)
-                                )
-                                if not bench_prices.empty and bench_ticker in bench_prices.columns:
-                                    bench_series = bench_prices[bench_ticker].dropna()
-                                    common_idx = port_value.index.intersection(bench_series.index)
-                                    if len(common_idx) >= 2:
-                                        port_norm = port_value.loc[common_idx]
-                                        bench_norm = bench_series.loc[common_idx]
-                                        port_base100 = port_norm / port_norm.iloc[0] * 100
-                                        bench_base100 = bench_norm / bench_norm.iloc[0] * 100
-                                        perf_port = port_base100.iloc[-1] / 100 - 1
-                                        perf_bench = bench_base100.iloc[-1] / 100 - 1
-                                        alpha = perf_port - perf_bench
-
-                                        m1, m2, m3 = st.columns(3)
-                                        m1.metric("Perf. portefeuille", f"{perf_port:.2%}")
-                                        m2.metric(f"Perf. {bench_label}", f"{perf_bench:.2%}")
-                                        m3.metric("Écart (alpha)", f"{alpha:.2%}")
-
-                                        fig_bench = go.Figure()
-                                        fig_bench.add_trace(
-                                            go.Scatter(
-                                                x=port_base100.index,
-                                                y=port_base100.values,
-                                                mode="lines",
-                                                name="Portefeuille",
-                                            )
-                                        )
-                                        fig_bench.add_trace(
-                                            go.Scatter(
-                                                x=bench_base100.index,
-                                                y=bench_base100.values,
-                                                mode="lines",
-                                                name=bench_label,
-                                            )
-                                        )
-                                        fig_bench.update_layout(
-                                            title=f"Portefeuille vs {bench_label} (base 100)",
-                                            yaxis_title="Base 100",
-                                        )
-                                        st.plotly_chart(fig_bench, use_container_width=True)
-                                    else:
-                                        st.info("Pas assez de dates communes pour la comparaison.")
-                                else:
-                                    st.warning(f"Impossible de charger l'indice {bench_label}.")
-                            except Exception as e:
-                                st.warning(f"Comparaison benchmark indisponible : {e}")
-
-                        _benchmark_comparison()
-                elif not tickers_sans_cours:
-                    st.warning("Aucune position valide à afficher.")
-            else:
-                st.header(f"📊 Aperçu des Derniers Cours de l'Indice : {indice_choisi}")
-                last_prices = prices.iloc[-1].reset_index()
-                last_prices.columns = ["Ticker", "Dernier Cours (Devise d'origine)"]
-                last_prices = add_company_names(
-                    last_prices, ticker_names, show_names=show_company_names, sectors=ticker_sectors
-                )
-                st.dataframe(
-                    last_prices.style.format(
-                        {"Dernier Cours (Devise d'origine)": "{:.2f}"}
-                    )
-                )
+            _render_synthese_plus_values(
+                prices=prices,
+                returns=returns,
+                ohlcv_sig=ohlcv_sig,
+            )
 
         elif vue == "Matrice de corrélation":
             st.header("📊 Matrice de Corrélation")
-            corr = cached_corr_matrix(ohlcv_sig, returns)
+            corr = cached_corr_matrix(ohlcv_sig, tickers_tuple, start_date_str)
             if show_company_names:
                 labels = {
                     t: ticker_label(t, ticker_names, True) for t in corr.index
                 }
                 corr = corr.rename(index=labels, columns=labels)
-            fig_corr = px.imshow(
-                corr,
-                text_auto=".2f",
-                color_continuous_scale="RdYlGn_r",
-                zmin=-1,
-                zmax=1,
-            )
-            st.plotly_chart(fig_corr, use_container_width=True)
+
+            @st.fragment
+            def _correlation_view():
+                c_corr1, c_corr2 = st.columns(2)
+                cluster_corr = c_corr1.checkbox(
+                    "Regrouper par similarité",
+                    value=True,
+                    help="Clustering hiérarchique : titres corrélés côte à côte.",
+                    key="corr_cluster",
+                )
+                triangle_corr = c_corr2.checkbox(
+                    "Triangle supérieur",
+                    value=True,
+                    help="Masque la moitié symétrique pour alléger la lecture.",
+                    key="corr_triangle",
+                )
+                rho_lo, rho_hi = st.slider(
+                    "Plage de ρ affichée (borne inférieure → supérieure)",
+                    min_value=-1.0,
+                    max_value=1.0,
+                    value=(-1.0, 1.0),
+                    step=0.05,
+                    help=(
+                        "Seules les corrélations dans cet intervalle sont colorées. "
+                        "Ex. −0,15 à +0,15 pour repérer les paires **peu corrélées**."
+                    ),
+                    key="corr_rho_range",
+                )
+                fig_corr = build_correlation_heatmap_figure(
+                    corr,
+                    cluster=cluster_corr,
+                    triangle=triangle_corr,
+                    rho_min=rho_lo,
+                    rho_max=rho_hi,
+                )
+                st.plotly_chart(fig_corr, use_container_width=True)
+                if rho_lo <= -0.95 and rho_hi >= 0.95:
+                    st.caption(
+                        "Échelle **RdBu** : bleu = corrélation négative, rouge = positive, blanc ≈ 0. "
+                        "ρ proche de **+1** : les titres bougent ensemble ; **−1** : mouvements opposés."
+                    )
+                else:
+                    st.caption(
+                        f"Filtre actif : **{rho_lo:+.2f} ≤ ρ ≤ {rho_hi:+.2f}** — "
+                        "cellules hors plage masquées (diagonale incluse si ρ = 1,00 sort de la plage). "
+                        "Réduisez la plage autour de **0** pour isoler les actifs diversifiants."
+                    )
+
+            _correlation_view()
 
         elif vue == "Analyse des risques":
             st.header("⚠️ Analyse des Risques")
@@ -939,7 +1310,7 @@ sur la période sélectionnée.
     | **Kurtosis (aplatissement)** | **> 0** : queues épaisses — événements extrêmes plus fréquents qu'une cloche normale. **< 0** : distribution plus « plate » au centre. |
                     """
                 )
-            metrics = cached_advanced_risk_metrics(ohlcv_sig, returns)
+            metrics = cached_advanced_risk_metrics(ohlcv_sig, tickers_tuple, start_date_str)
             metrics = label_index_with_names(metrics, ticker_names, show_company_names)
             st.caption(
                 "Rendements et volatilité en **%** (annualisés) · VaR/CVaR en **%** journalier · "
@@ -955,6 +1326,53 @@ sur la période sélectionnée.
                     subset=["Volatilité (Sigma)", "VaR 95% (Jour)", "CVaR 95% (Jour)"],
                 )
             )
+
+            st.markdown("### Carte rendement / volatilité")
+            risk_label_map = {
+                col: ticker_label(col, ticker_names, show_company_names)
+                for col in returns.columns
+            }
+            scatter_weights = None
+            if mode_portfolio_actif and portefeuille_dict:
+                scatter_weights = compute_holdings_weights(
+                    prices,
+                    {tk: portefeuille_dict[tk]["Quantite"] for tk in portefeuille_dict},
+                    usd_to_eur=cached_usd_to_eur_rate(),
+                    is_usd_fn=is_usd_ticker,
+                    universe=list(returns.columns),
+                )
+            fig_rr = build_risk_return_scatter_figure(
+                returns,
+                weights=scatter_weights,
+                column_labels=risk_label_map,
+            )
+            if fig_rr is not None:
+                st.plotly_chart(fig_rr, use_container_width=True)
+            st.caption(
+                "Chaque point = un actif (annualisé). **Couleur** = Sharpe · "
+                "**Taille** = poids portefeuille si mode CSV actif."
+            )
+
+            @st.fragment
+            def _return_distribution_view():
+                dist_ticker = st.selectbox(
+                    "Distribution des rendements journaliers",
+                    list(returns.columns),
+                    format_func=lambda t: risk_label_map.get(t, t),
+                    key="risk_return_dist_ticker",
+                )
+                fig_dist = build_returns_distribution_var_figure(
+                    returns[dist_ticker],
+                    asset_label=risk_label_map.get(dist_ticker, dist_ticker),
+                )
+                if fig_dist is not None:
+                    st.plotly_chart(fig_dist, use_container_width=True)
+                st.caption(
+                    "Trait rouge = **VaR 95 %** (5 % pires journées). "
+                    "Histogramme en densité de probabilité."
+                )
+
+            _return_distribution_view()
 
             st.markdown("### Boîtes à moustaches — rendements journaliers")
             st.caption(
@@ -1047,7 +1465,7 @@ sur la période sélectionnée.
                 )
                 risk_free_rate = rf_pct / 100.0 if show_cal else 0.0
 
-                weights = cached_markowitz_weights(ohlcv_sig, returns)
+                weights = cached_markowitz_weights(ohlcv_sig, tickers_tuple, start_date_str)
 
                 current_weights = None
                 total_valeur_eur = None
@@ -1223,14 +1641,17 @@ sur la période sélectionnée.
 
                 st.markdown("### Frontière efficiente")
                 has_current = current_weights is not None and current_weights.sum() > 0
+                current_weights_items = (
+                    tuple(current_weights.items()) if has_current else None
+                )
                 fig_frontier = cached_markowitz_frontier_figure(
                     ohlcv_sig,
-                    returns,
-                    weights,
+                    tickers_tuple,
+                    start_date_str,
                     risk_free_rate,
                     n_random,
                     has_current,
-                    current_weights if has_current else None,
+                    current_weights_items,
                 )
                 st.plotly_chart(fig_frontier, use_container_width=True)
 
@@ -1284,19 +1705,32 @@ sur la période sélectionnée.
             st.header("📈 Analyse technique")
             st.caption(
                 "Indicateurs calculés localement à partir des prix Yahoo (graphiques en chandeliers japonais) : "
-                "RSI, MACD, stochastique, moyennes mobiles 20/50/200, Bollinger, ATR, "
+                "RSI, MACD, stochastique, SuperTrend, moyennes mobiles 20/50/200, Bollinger, ATR, "
                 "volumes, OBV, MFI, régression linéaire, supports/résistances et Fibonacci."
             )
             @st.fragment
             def _technical_summary():
-                rsi_period = st.slider("Période RSI", 7, 21, 14, key="tech_rsi_period")
+                c_rsi, c_st_p, c_st_m = st.columns(3)
+                with c_rsi:
+                    rsi_period = st.slider("Période RSI", 7, 21, 14, key="tech_rsi_period")
+                with c_st_p:
+                    st_period = st.slider("SuperTrend — période ATR", 7, 21, 10, key="tech_st_period")
+                with c_st_m:
+                    st_multiplier = st.slider(
+                        "SuperTrend — multiplicateur ATR",
+                        1.0,
+                        5.0,
+                        3.0,
+                        0.1,
+                        key="tech_st_multiplier",
+                    )
                 tech_df = cached_technical_indicators(
                     ohlcv_sig,
                     rsi_period,
-                    prices,
-                    volumes,
-                    highs,
-                    lows,
+                    tickers_tuple,
+                    start_date_str,
+                    supertrend_period=st_period,
+                    supertrend_multiplier=st_multiplier,
                 )
                 if tech_df.empty:
                     st.warning("Pas assez de données pour calculer les indicateurs techniques.")
@@ -1304,6 +1738,8 @@ sur la période sélectionnée.
                     return
                 st.session_state["technical_df"] = tech_df
                 st.session_state["technical_rsi_period"] = rsi_period
+                st.session_state["technical_st_period"] = st_period
+                st.session_state["technical_st_multiplier"] = st_multiplier
                 tech_display_df = add_company_names(
                     tech_df, ticker_names, show_names=show_company_names, sectors=ticker_sectors
                 )
@@ -1313,16 +1749,19 @@ sur la période sélectionnée.
                 )
                 st.caption(
                     "Prix et moyennes en **/ action** · volumes en **titres** · "
-                    "RSI/MFI/stochastique sur **0–100** · ATR/Prix en **%**."
+                    "RSI/MFI/stochastique sur **0–100** · ATR/Prix en **%**. "
+                    "**Vert** = survente · **rouge** = surachat (colonnes signal et indicateurs)."
                 )
-                st.dataframe(
-                    tech_display.style.format(tech_format, na_rep="-")
-                )
+                styled_tech = tech_display.style.format(tech_format, na_rep="-")
+                styled_tech = style_technical_table(styled_tech)
+                st.dataframe(styled_tech, use_container_width=True)
 
             @st.fragment
             def _technical_detail():
                 tech_df = st.session_state.get("technical_df")
                 rsi_period_detail = st.session_state.get("technical_rsi_period", 14)
+                st_period_detail = st.session_state.get("technical_st_period", 10)
+                st_multiplier_detail = st.session_state.get("technical_st_multiplier", 3.0)
                 if tech_df is None or tech_df.empty:
                     return
                 detail_ticker = st.selectbox(
@@ -1335,13 +1774,17 @@ sur la période sélectionnée.
                     ohlcv_sig,
                     detail_ticker,
                     rsi_period_detail,
-                    prices,
-                    volumes,
-                    highs,
-                    lows,
-                    opens,
-                    ohlc_closes,
+                    tickers_tuple,
+                    start_date_str,
+                    supertrend_period=st_period_detail,
+                    supertrend_multiplier=st_multiplier_detail,
                 )
+                if not bundle or "s" not in bundle:
+                    st.warning(
+                        f"Données insuffisantes pour les graphiques de "
+                        f"{detail_label} — actualisez les cours."
+                    )
+                    return
                 s = bundle["s"]
                 rsi_series = bundle["rsi"]
                 macd_line, signal_line, histogram = bundle["macd"]
@@ -1349,150 +1792,74 @@ sur la période sélectionnée.
                 sma200 = bundle["sma200"]
                 bb_upper, bb_mid, bb_lower = bundle["bollinger"]
                 stoch_k, stoch_d = bundle["stochastic"]
+                st_line = bundle["supertrend"]
+                st_dir = bundle["supertrend_direction"]
                 vol_s = bundle["vol_s"]
                 has_volume = bundle["has_volume"]
                 ohlc = bundle["ohlc"]
                 has_ohlc = bundle["has_ohlc"]
 
-                fig = make_subplots(
-                    rows=2,
-                    cols=1,
-                    shared_xaxes=True,
-                    vertical_spacing=0.06,
-                    row_heights=[0.72, 0.28],
-                    subplot_titles=(f"{detail_label} — Chandeliers & MM", "Volume échangé"),
+                supports, resistances = compute_support_resistance(s, window=10, n_levels=2)
+                vol_ticker = (
+                    volumes[detail_ticker].reindex(s.index)
+                    if not volumes.empty and detail_ticker in volumes.columns
+                    else vol_s
                 )
-                if has_ohlc:
-                    fig.add_trace(candlestick_trace(ohlc), row=1, col=1)
-                else:
-                    fig.add_trace(
-                        go.Scatter(x=s.index, y=s, mode="lines", name="Prix"),
-                        row=1,
-                        col=1,
+
+                fig_overview = build_technical_overview_figure(
+                    s,
+                    detail_label=detail_label,
+                    ohlc=ohlc if has_ohlc else None,
+                    volume_series=vol_ticker if has_volume else None,
+                    sma50=sma50,
+                    sma200=sma200,
+                    bb_upper=bb_upper,
+                    bb_mid=bb_mid,
+                    bb_lower=bb_lower,
+                    rsi_series=rsi_series,
+                    rsi_period=rsi_period_detail,
+                    supertrend_series=st_line,
+                    supertrend_direction=st_dir,
+                    supports=supports,
+                    resistances=resistances,
+                )
+                if fig_overview is not None:
+                    st.plotly_chart(fig_overview, use_container_width=True)
+                    st.caption(
+                        "Survol synchronisé sur les **3 panneaux** (prix, volume, RSI). "
+                        "**SuperTrend** : vert = tendance haussière · rouge = baissière. "
+                        "Zones **vertes** RSI 0–30 (survente), **rouges** 70–100 (surachat). "
+                        "Traits **S** / **R** = supports et résistances locaux."
                     )
-                if not sma50.empty:
-                    fig.add_trace(
-                        go.Scatter(x=sma50.index, y=sma50, mode="lines", name="SMA 50"),
-                        row=1,
-                        col=1,
-                    )
-                if not sma200.empty:
-                    fig.add_trace(
-                        go.Scatter(x=sma200.index, y=sma200, mode="lines", name="SMA 200"),
-                        row=1,
-                        col=1,
-                    )
-                if not bb_upper.empty:
-                    if not bb_mid.empty:
-                        fig.add_trace(
-                            go.Scatter(
-                                x=bb_mid.index,
-                                y=bb_mid,
-                                mode="lines",
-                                name="SMA 20 (Bollinger)",
-                                line=dict(color="orange", width=1.5),
-                            ),
-                            row=1,
-                            col=1,
+                    st.info(interpret_rsi_comment(rsi_series, rsi_period_detail))
+                    st.info(
+                        interpret_supertrend_comment(
+                            s,
+                            st_line,
+                            st_dir,
+                            period=st_period_detail,
+                            multiplier=st_multiplier_detail,
                         )
-                    fig.add_trace(
-                        go.Scatter(
-                            x=bb_upper.index,
-                            y=bb_upper,
-                            mode="lines",
-                            name="Bollinger haut",
-                            line=dict(dash="dot"),
-                        ),
-                        row=1,
-                        col=1,
                     )
-                    fig.add_trace(
-                        go.Scatter(
-                            x=bb_lower.index,
-                            y=bb_lower,
-                            mode="lines",
-                            name="Bollinger bas",
-                            line=dict(dash="dot"),
-                        ),
-                        row=1,
-                        col=1,
-                    )
-                if has_volume:
-                    vol_aligned = volumes[detail_ticker].reindex(s.index)
-                    vol_sma20 = compute_volume_sma(vol_aligned, 20)
-                    vol_idx = vol_aligned.dropna().index
-                    bar_colors = []
-                    for d in vol_idx:
-                        if has_ohlc and d in ohlc.index:
-                            bar_colors.append(
-                                "#26a69a" if ohlc.loc[d, "close"] >= ohlc.loc[d, "open"] else "#ef5350"
-                            )
-                        elif d in s.index and pd.notna(s.loc[d]) and pd.notna(s.shift(1).loc[d]):
-                            bar_colors.append(
-                                "#26a69a" if s.loc[d] >= s.shift(1).loc[d] else "#ef5350"
-                            )
-                        else:
-                            bar_colors.append("#42a5f5")
-                    fig.add_trace(
-                        go.Bar(
-                            x=vol_idx,
-                            y=vol_aligned.loc[vol_idx],
-                            name="Volume",
-                            marker_color=bar_colors,
-                            opacity=0.7,
-                        ),
-                        row=2,
-                        col=1,
-                    )
-                    if not vol_sma20.empty:
-                        fig.add_trace(
-                            go.Scatter(
-                                x=vol_sma20.index,
-                                y=vol_sma20,
-                                mode="lines",
-                                name="Moy. volume 20j",
-                                line=dict(color="orange", width=2),
-                            ),
-                            row=2,
-                            col=1,
-                        )
-                fig.update_layout(height=620, showlegend=True, xaxis_rangeslider_visible=False)
-                fig.update_yaxes(title_text="Prix", row=1, col=1)
-                fig.update_yaxes(title_text="Titres", row=2, col=1)
-                st.plotly_chart(fig, use_container_width=True)
 
                 c1, c2 = st.columns(2)
                 with c1:
-                    fig_rsi = go.Figure()
-                    fig_rsi.add_trace(
-                        go.Scatter(x=rsi_series.index, y=rsi_series, mode="lines", name=f"RSI ({rsi_period_detail})")
+                    fig_stoch = build_technical_stochastic_figure(
+                        stoch_k, stoch_d, detail_label=detail_label
                     )
-                    fig_rsi.add_hline(y=70, line_dash="dot", line_color="red")
-                    fig_rsi.add_hline(y=30, line_dash="dot", line_color="green")
-                    fig_rsi.update_layout(title=f"{detail_label} — RSI", yaxis=dict(range=[0, 100]))
-                    st.plotly_chart(fig_rsi, use_container_width=True)
-                    st.info(interpret_rsi_comment(rsi_series, rsi_period_detail))
-                with c2:
-                    fig_stoch = go.Figure()
-                    fig_stoch.add_trace(go.Scatter(x=stoch_k.index, y=stoch_k, mode="lines", name="%K"))
-                    fig_stoch.add_trace(go.Scatter(x=stoch_d.index, y=stoch_d, mode="lines", name="%D"))
-                    fig_stoch.add_hline(y=80, line_dash="dot", line_color="red")
-                    fig_stoch.add_hline(y=20, line_dash="dot", line_color="green")
-                    fig_stoch.update_layout(title=f"{detail_label} — Stochastique", yaxis=dict(range=[0, 100]))
-                    st.plotly_chart(fig_stoch, use_container_width=True)
+                    if fig_stoch is not None:
+                        st.plotly_chart(fig_stoch, use_container_width=True)
                     st.info(interpret_stochastic_comment(stoch_k, stoch_d))
-
-                fig_macd = go.Figure()
-                fig_macd.add_trace(go.Scatter(x=macd_line.index, y=macd_line, mode="lines", name="MACD"))
-                fig_macd.add_trace(go.Scatter(x=signal_line.index, y=signal_line, mode="lines", name="Signal"))
-                fig_macd.add_trace(go.Bar(x=histogram.index, y=histogram, name="Histogramme", opacity=0.4))
-                fig_macd.update_layout(title=f"{detail_label} — MACD")
-                st.plotly_chart(fig_macd, use_container_width=True)
-                st.info(interpret_macd_comment(macd_line, signal_line, histogram))
+                with c2:
+                    fig_macd = build_technical_macd_figure(
+                        macd_line, signal_line, histogram, detail_label=detail_label
+                    )
+                    if fig_macd is not None:
+                        st.plotly_chart(fig_macd, use_container_width=True)
+                    st.info(interpret_macd_comment(macd_line, signal_line, histogram))
 
                 st.subheader("📐 Tendance, supports & Fibonacci")
                 reg_channel = compute_linear_regression_channel(s)
-                supports, resistances = compute_support_resistance(s, window=10, n_levels=2)
                 h_series = (
                     highs[detail_ticker].reindex(s.index)
                     if not highs.empty and detail_ticker in highs.columns
@@ -1745,19 +2112,29 @@ sur la période sélectionnée.
 | **Lignes orange (ACF)** | Décalages (en jours) correspondant aux **périodes dominantes** détectées par FFT : si l'ACF est aussi élevée à ces lags, le cycle FFT est **confirmé** ; si l'ACF reste proche de 0, le pic FFT peut être **accidentel**. |
 | **Prix dé-trendé** | On retire la tendance longue pour isoler les oscillations analysées par FFT. |
 | **Tendance de fond** | Ligne grise en **€** : tendance retirée avant FFT ; type choisi sous le graphique cyclique. |
-| **R² tendance** | Coefficient affiché en **métrique** (4ᵉ colonne) et sous le graphique cyclique : qualité de l'ajustement de la tendance au **prix réel**. **1,000** = parfait · **> 0,85** = bon · **< 0,5** = la tendance choisie ne décrit pas bien le cours (cycles moins fiables). |
-| **RMSE** | Écart-type moyen (€) entre prix réel et tendance — complète le R² (affiché sous le graphique cyclique). |
+| **R² tendance** | Part de la **variance du cours** expliquée par la tendance seule (avant FFT). Affiché avec un **niveau de fiabilité** : ≥ 0,85 excellente · 0,65–0,85 bonne · 0,50–0,65 modérée · 0,30–0,50 faible · < 0,30 très faible. |
+| **RMSE** | Écart quadratique moyen entre cours et tendance, en **€ / action**, **€ (portefeuille)** ou **pts (indice base 100)** selon la série ; complété par un **% du prix moyen** (comparable entre titres). |
+| **Corr. modèle (avec dé-trend)** | Corrélation de Pearson entre le **cours** et le modèle FFT **tendance + cycles** (courbe cyan), sur l'historique. Tendance retirée avant FFT puis réinjectée. |
+| **Corr. harmonique vs cours** | Régression sin/cos aux périodes FFT — souvent plus fidèle que la reconstruction par pics seuls. |
+| **Corr. vs MM41 / lissage** | Modes MM41 ou STL : qualité du modèle sur la **série lissée** (sans bruit journalier). |
+| **Corr. modèle (sans dé-trend)** | (Modes classiques) FFT sur log(prix) sans retirer la tendance — comparaison. |
 | **Modèle FFT** | Tendance + cycles combinés, reprojetés en **prix** (cyan) ; prolongation **+30 %** en pointillé après la ligne « Fin historique ». |
 | **Prix** | Courbe **bleue** : historique réel du titre. |
 
-**Tendances disponibles :** **Log-linéaire** (croissance % constante) · **Linéaire €** (droite sur le prix)
-· **Hodrick-Prescott** (courbe lisse). Comparez les **R²** affichés en changeant la tendance sous le graphique cyclique.
+**Tendances disponibles :** **Log-linéaire** · **Linéaire €** · **Hodrick-Prescott**
+· **MM centrée 41 j** (analyse, ±20 séances — regard futur) · **MM causale 41 j** (sans look-ahead, extrapolation)
+· **STL 21 j** (décomposition trend + saison, FFT sur la saison). Comparez les **R²** et corrélations en changeant la tendance.
+
+**Reconstruction du modèle :** **FFT (pics)** · **Harmonique (périodes FFT)** · **Harmonique (21–126 j fixes)**.
 
 **Extrapolation :** le modèle mathématique (tendance + harmoniques) est prolongé de **30 %** de la durée
 observée (jours de bourse). Zone pointillée = **scénario exploratoire**, pas une prévision garantie.
 
 **Précautions :** un pic FFT peut venir du hasard, d'un dividende récurrent mal lissé ou d'une
 fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
+
+**Amplitude en fin de série :** cochez **Priorité aux valeurs récentes** pour éviter l'atténuation
+due à la fenêtre Hanning (reconstruction harmonique pondérée + tendance locale).
                     """
                 )
 
@@ -1767,222 +2144,272 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                     "Élargissez la date de début dans la barre latérale."
                 )
             else:
-                c_fft1, c_fft2, c_fft3 = st.columns(3)
-                min_period = c_fft1.slider(
-                    "Période min. recherchée (jours)",
-                    min_value=3,
-                    max_value=30,
-                    value=5,
-                    step=1,
-                )
-                max_period = c_fft2.slider(
-                    "Période max. recherchée (jours)",
-                    min_value=30,
-                    max_value=min(504, len(prices) // 2),
-                    value=min(252, max(60, len(prices) // 2)),
-                    step=5,
-                )
-                top_peaks = c_fft3.slider("Nombre de pics affichés", 3, 10, 5)
-
-                def _fft_trend_quality_caption(result):
-                    if not result:
-                        return
-                    r2 = result.get("trend_r2")
-                    rmse = result.get("trend_rmse")
-                    r2_txt = f"{r2:.3f}" if r2 is not None and not np.isnan(r2) else "—"
-                    rmse_txt = f"{rmse:,.2f}" if rmse is not None and not np.isnan(rmse) else "—"
-                    st.caption(
-                        f"Tendance : **{fft_trend_mode_label(result.get('trend_mode', trend_mode))}** · "
-                        f"R² = **{r2_txt}** · RMSE = **{rmse_txt}** € "
-                        "(qualité de la tendance retirée avant FFT — voir légende)"
+                @st.fragment
+                def _fft_interactive():
+                    c_fft1, c_fft2, c_fft3 = st.columns(3)
+                    min_period = c_fft1.slider(
+                        "Période min. recherchée (jours)",
+                        min_value=3,
+                        max_value=30,
+                        value=5,
+                        step=1,
                     )
-
-                portfolio_tickers_fft = [t for t in liste_tickers if t in prices.columns]
-                quantities_fft = None
-                portfolio_fft_label = "Portefeuille (indice équipondéré, base 100)"
-                if mode_portfolio_actif and portefeuille_dict:
-                    quantities_fft = {
-                        t: portefeuille_dict[t]["Quantite"]
-                        for t in portfolio_tickers_fft
-                        if t in portefeuille_dict
-                    }
-                    portfolio_fft_label = "Portefeuille complet (valorisation €, pondéré par quantités)"
-
-                usd_to_eur_fft = cached_usd_to_eur_rate() if mode_portfolio_actif else 1.0
-                portfolio_series = build_portfolio_price_for_fft(
-                    prices,
-                    tickers=portfolio_tickers_fft,
-                    quantities=quantities_fft,
-                    usd_to_eur=usd_to_eur_fft,
-                    is_usd_fn=is_usd_ticker,
-                )
-
-                st.markdown("### Portefeuille complet")
-                st.caption(portfolio_fft_label)
-
-                if "fft_trend_mode" not in st.session_state:
-                    st.session_state.fft_trend_mode = FFT_TREND_LOG_LINEAR
-                trend_mode = st.session_state.fft_trend_mode
-
-                if portfolio_series is None or len(portfolio_series.dropna()) < 40:
-                    st.warning(
-                        "Historique insuffisant pour la FFT du portefeuille agrégé "
-                        "(minimum ~40 séances communes)."
+                    max_period = c_fft2.slider(
+                        "Période max. recherchée (jours)",
+                        min_value=30,
+                        max_value=min(504, len(prices) // 2),
+                        value=min(252, max(60, len(prices) // 2)),
+                        step=5,
                     )
-                else:
-                    port_fft = cached_fft_periodicity(
-                        f"{ohlcv_sig}|portfolio|{portfolio_fft_label}|{trend_mode}",
-                        min_period,
-                        max_period,
-                        top_peaks,
-                        trend_mode,
-                        portfolio_series,
-                    )
-                    if port_fft is None:
-                        st.warning("FFT portefeuille indisponible sur la période.")
-                    else:
-                        port_peaks = port_fft["peaks"].drop(columns=["_freq_idx"], errors="ignore")
-                        _render_fft_headline_metrics(port_fft, port_peaks)
-                        st.plotly_chart(
-                            build_fft_spectral_acf_chart(
-                                port_fft,
-                                title="Densité spectrale & autocorrélation — portefeuille complet",
-                            ),
-                            use_container_width=True,
-                        )
-                        _acf_reading = interpret_fft_acf_reading(port_fft)
-                        if _acf_reading:
-                            st.info(_acf_reading)
-                        port_peaks_disp = rename_columns_for_display(port_peaks, FFT_LABELS)
-                        st.dataframe(
-                            port_peaks_disp.style.format(
-                                format_map_for_labeled_columns(
-                                    port_peaks_disp, FFT_LABELS, FFT_FORMAT
-                                )
-                            ),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-                        _trend_ctrl, _trend_metrics = st.columns([1, 2])
-                        with _trend_ctrl:
-                            st.selectbox(
-                                "Tendance de fond",
-                                options=list(FFT_TREND_OPTIONS.keys()),
-                                format_func=fft_trend_mode_label,
-                                key="fft_trend_mode",
-                                help="Méthode pour isoler les cycles avant FFT.",
-                            )
-                        with _trend_metrics:
-                            _fft_trend_quality_caption(port_fft)
-                        st.plotly_chart(
-                            build_fft_cyclic_chart(
-                                port_fft,
-                                n_components=min(top_peaks, len(port_fft["peaks"])),
-                                title="Cycle estimé vs portefeuille complet",
-                            ),
-                            use_container_width=True,
-                        )
-                        if len(port_peaks):
-                            st.success(
-                                f"Sur l'ensemble du portefeuille, le cycle le plus visible est "
-                                f"**{port_peaks.iloc[0]['Période']}** "
-                                f"(~{port_peaks.iloc[0]['Puissance relative']:.0%} de la puissance "
-                                "dans la bande analysée)."
-                            )
-
-                st.markdown("---")
-                st.markdown("### Détail par actif")
-
-                fft_summary = cached_fft_summary(
-                    ohlcv_sig,
-                    min_period,
-                    max_period,
-                    3,
-                    trend_mode,
-                    prices,
-                )
-                if fft_summary.empty:
-                    st.warning("Aucun ticker avec assez de données pour l'analyse FFT.")
-                else:
-                    fft_summary = add_company_names(
-                        fft_summary, ticker_names, show_names=show_company_names, sectors=ticker_sectors
-                    )
-                    fft_display = rename_columns_for_display(fft_summary, FFT_LABELS)
-                    fmt_cols = format_map_for_labeled_columns(
-                        fft_display, FFT_LABELS, FFT_FORMAT
-                    )
-                    st.markdown("### Synthèse — périodes dominantes par actif")
-                    st.caption(
-                        "Périodes en **jours de bourse** (colonne numérique) ou **libellé** "
-                        "(ex. « 21 j (~4,2 sem.) ») · poids/force en **%** de la puissance FFT."
-                    )
-                    st.dataframe(
-                        fft_display.style.format(
-                            {k: v for k, v in fmt_cols.items() if k in fft_display.columns},
-                            na_rep="—",
+                    top_peaks = c_fft3.slider("Nombre de pics affichés", 3, 10, 5)
+                    recency_fit = st.checkbox(
+                        "Priorité aux valeurs récentes (amplitude)",
+                        value=True,
+                        key="fft_recency_fit",
+                        help=(
+                            "Reconstruction sans fenêtre Hanning + pondération récente "
+                            "et tendance locale en fin de série — réduit l'écart en bout d'historique."
                         ),
-                        use_container_width=True,
                     )
 
-                    fft_ticker = st.selectbox(
-                        "Détail FFT par actif",
-                        fft_summary["Ticker"],
-                        format_func=lambda t: ticker_label(t, ticker_names, show_company_names),
+                    def _fft_trend_quality_caption(result, price_unit=FFT_PRICE_UNIT_EUR):
+                        if not result:
+                            return
+                        summary = summarize_fft_trend_quality(result, price_unit=price_unit)
+                        if summary.get("caption_md"):
+                            st.caption(summary["caption_md"])
+
+                    portfolio_tickers_fft = [t for t in liste_tickers if t in prices.columns]
+                    quantities_fft = None
+                    portfolio_fft_label = "Portefeuille (indice équipondéré, base 100)"
+                    if mode_portfolio_actif and portefeuille_dict:
+                        quantities_fft = {
+                            t: portefeuille_dict[t]["Quantite"]
+                            for t in portfolio_tickers_fft
+                            if t in portefeuille_dict
+                        }
+                        portfolio_fft_label = "Portefeuille complet (valorisation €, pondéré par quantités)"
+                    port_price_unit = (
+                        FFT_PRICE_UNIT_PORTFOLIO if quantities_fft else FFT_PRICE_UNIT_INDEX
                     )
-                    fft_result = cached_fft_periodicity(
-                        f"{ohlcv_sig}|{fft_ticker}|{trend_mode}",
+
+                    usd_to_eur_fft = cached_usd_to_eur_rate() if mode_portfolio_actif else 1.0
+                    portfolio_series = build_portfolio_price_for_fft(
+                        prices,
+                        tickers=portfolio_tickers_fft,
+                        quantities=quantities_fft,
+                        usd_to_eur=usd_to_eur_fft,
+                        is_usd_fn=is_usd_ticker,
+                    )
+
+                    st.markdown("### Portefeuille complet")
+                    st.caption(portfolio_fft_label)
+
+                    if "fft_trend_mode" not in st.session_state:
+                        st.session_state.fft_trend_mode = FFT_TREND_LOG_LINEAR
+                    if "fft_recon_mode" not in st.session_state:
+                        st.session_state.fft_recon_mode = FFT_RECON_FFT
+                    trend_mode = st.session_state.fft_trend_mode
+                    recon_mode = st.session_state.fft_recon_mode
+
+                    if portfolio_series is None or len(portfolio_series.dropna()) < 40:
+                        st.warning(
+                            "Historique insuffisant pour la FFT du portefeuille agrégé "
+                            "(minimum ~40 séances communes)."
+                        )
+                    else:
+                        port_fft = cached_fft_periodicity_portfolio(
+                            ohlcv_sig,
+                            tickers_tuple,
+                            start_date_str,
+                            tuple(sorted(quantities_fft.items())) if quantities_fft else (),
+                            bool(mode_portfolio_actif),
+                            min_period,
+                            max_period,
+                            top_peaks,
+                            trend_mode,
+                        )
+                        if port_fft is None:
+                            st.warning("FFT portefeuille indisponible sur la période.")
+                        else:
+                            port_peaks = port_fft["peaks"].drop(columns=["_freq_idx"], errors="ignore")
+                            _render_fft_headline_metrics(
+                                port_fft,
+                                port_peaks,
+                                n_components=min(top_peaks, len(port_fft["peaks"])),
+                                price_unit=port_price_unit,
+                                recon_mode=recon_mode,
+                                recency_weighted=recency_fit,
+                                recency_calibrate=recency_fit,
+                            )
+                            st.plotly_chart(
+                                build_fft_spectral_acf_chart(
+                                    port_fft,
+                                    title="Densité spectrale & autocorrélation — portefeuille complet",
+                                ),
+                                use_container_width=True,
+                            )
+                            _acf_reading = interpret_fft_acf_reading(port_fft)
+                            if _acf_reading:
+                                st.info(_acf_reading)
+                            port_peaks_disp = rename_columns_for_display(port_peaks, FFT_LABELS)
+                            st.dataframe(
+                                port_peaks_disp.style.format(
+                                    format_map_for_labeled_columns(
+                                        port_peaks_disp, FFT_LABELS, FFT_FORMAT
+                                    )
+                                ),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                            _trend_ctrl, _recon_ctrl, _trend_metrics = st.columns([1, 1, 2])
+                            with _trend_ctrl:
+                                st.selectbox(
+                                    "Tendance de fond",
+                                    options=list(FFT_TREND_OPTIONS.keys()),
+                                    format_func=fft_trend_mode_label,
+                                    key="fft_trend_mode",
+                                    help="Méthode pour isoler les cycles avant FFT.",
+                                )
+                            with _recon_ctrl:
+                                st.selectbox(
+                                    "Reconstruction du modèle",
+                                    options=list(FFT_RECON_OPTIONS.keys()),
+                                    format_func=fft_recon_mode_label,
+                                    key="fft_recon_mode",
+                                    help=(
+                                        "Comment reconstruire le prix modèle : pics FFT ou "
+                                        "régression harmonique sin/cos."
+                                    ),
+                                )
+                            with _trend_metrics:
+                                _fft_trend_quality_caption(port_fft, price_unit=port_price_unit)
+                            st.plotly_chart(
+                                build_fft_cyclic_chart(
+                                    port_fft,
+                                    n_components=min(top_peaks, len(port_fft["peaks"])),
+                                    title="Cycle estimé vs portefeuille complet",
+                                    recon_mode=recon_mode,
+                                    recency_weighted=recency_fit,
+                                    recency_calibrate=recency_fit,
+                                ),
+                                use_container_width=True,
+                            )
+                            if len(port_peaks):
+                                st.success(
+                                    f"Sur l'ensemble du portefeuille, le cycle le plus visible est "
+                                    f"**{port_peaks.iloc[0]['Période']}** "
+                                    f"(~{port_peaks.iloc[0]['Puissance relative']:.0%} de la puissance "
+                                    "dans la bande analysée)."
+                                )
+
+                    st.markdown("---")
+                    st.markdown("### Détail par actif")
+
+                    fft_summary = cached_fft_summary(
+                        ohlcv_sig,
                         min_period,
                         max_period,
-                        top_peaks,
+                        3,
                         trend_mode,
-                        prices[fft_ticker],
+                        tickers_tuple,
+                        start_date_str,
                     )
-                    if fft_result is None:
-                        st.warning("FFT indisponible pour ce titre.")
+                    if fft_summary.empty:
+                        st.warning("Aucun ticker avec assez de données pour l'analyse FFT.")
                     else:
-                        detail_label = ticker_label(
-                            fft_ticker, ticker_names, show_company_names
+                        fft_summary = add_company_names(
+                            fft_summary, ticker_names, show_names=show_company_names, sectors=ticker_sectors
                         )
-                        peaks = fft_result["peaks"].drop(columns=["_freq_idx"], errors="ignore")
-                        _render_fft_headline_metrics(fft_result, peaks)
-                        st.plotly_chart(
-                            build_fft_spectral_acf_chart(
-                                fft_result,
-                                title=f"Densité spectrale & autocorrélation — {detail_label}",
-                            ),
-                            use_container_width=True,
+                        fft_display = rename_columns_for_display(fft_summary, FFT_LABELS)
+                        fmt_cols = format_map_for_labeled_columns(
+                            fft_display, FFT_LABELS, FFT_FORMAT
                         )
-                        _acf_reading = interpret_fft_acf_reading(fft_result)
-                        if _acf_reading:
-                            st.info(_acf_reading)
-                        peaks_disp = rename_columns_for_display(peaks, FFT_LABELS)
+                        st.markdown("### Synthèse — périodes dominantes par actif")
+                        st.caption(
+                            "Périodes en **jours de bourse** (colonne numérique) ou **libellé** "
+                            "(ex. « 21 j (~4,2 sem.) ») · poids/force en **%** de la puissance FFT."
+                        )
                         st.dataframe(
-                            peaks_disp.style.format(
-                                format_map_for_labeled_columns(
-                                    peaks_disp, FFT_LABELS, FFT_FORMAT
-                                )
-                            ),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-                        _fft_trend_quality_caption(fft_result)
-                        st.plotly_chart(
-                            build_fft_cyclic_chart(
-                                fft_result,
-                                n_components=min(top_peaks, len(fft_result["peaks"])),
-                                title=f"Cycle estimé vs prix — {detail_label}",
+                            fft_display.style.format(
+                                {k: v for k, v in fmt_cols.items() if k in fft_display.columns},
+                                na_rep="—",
                             ),
                             use_container_width=True,
                         )
-                        if len(peaks):
-                            p1 = peaks.iloc[0]["Période"]
-                            w1 = peaks.iloc[0]["Puissance relative"]
-                            st.info(
-                                f"Cycle le plus marqué pour **{detail_label}** : **{p1}** "
-                                f"(~{w1:.0%} de la puissance dans la bande analysée). "
-                                "À interpréter comme une **tendance cyclique possible**, pas une règle stricte."
-                            )
 
+                        fft_ticker = st.selectbox(
+                            "Détail FFT par actif",
+                            fft_summary["Ticker"],
+                            format_func=lambda t: ticker_label(t, ticker_names, show_company_names),
+                        )
+                        fft_result = cached_fft_periodicity_ticker(
+                            ohlcv_sig,
+                            tickers_tuple,
+                            start_date_str,
+                            fft_ticker,
+                            min_period,
+                            max_period,
+                            top_peaks,
+                            trend_mode,
+                        )
+                        if fft_result is None:
+                            st.warning("FFT indisponible pour ce titre.")
+                        else:
+                            detail_label = ticker_label(
+                                fft_ticker, ticker_names, show_company_names
+                            )
+                            peaks = fft_result["peaks"].drop(columns=["_freq_idx"], errors="ignore")
+                            _render_fft_headline_metrics(
+                                fft_result,
+                                peaks,
+                                n_components=min(top_peaks, len(fft_result["peaks"])),
+                                recon_mode=recon_mode,
+                                recency_weighted=recency_fit,
+                                recency_calibrate=recency_fit,
+                            )
+                            st.plotly_chart(
+                                build_fft_spectral_acf_chart(
+                                    fft_result,
+                                    title=f"Densité spectrale & autocorrélation — {detail_label}",
+                                ),
+                                use_container_width=True,
+                            )
+                            _acf_reading = interpret_fft_acf_reading(fft_result)
+                            if _acf_reading:
+                                st.info(_acf_reading)
+                            peaks_disp = rename_columns_for_display(peaks, FFT_LABELS)
+                            st.dataframe(
+                                peaks_disp.style.format(
+                                    format_map_for_labeled_columns(
+                                        peaks_disp, FFT_LABELS, FFT_FORMAT
+                                    )
+                                ),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                            _fft_trend_quality_caption(fft_result)
+                            st.plotly_chart(
+                                build_fft_cyclic_chart(
+                                    fft_result,
+                                    n_components=min(top_peaks, len(fft_result["peaks"])),
+                                    title=f"Cycle estimé vs prix — {detail_label}",
+                                    recon_mode=recon_mode,
+                                    recency_weighted=recency_fit,
+                                    recency_calibrate=recency_fit,
+                                ),
+                                use_container_width=True,
+                            )
+                            if len(peaks):
+                                p1 = peaks.iloc[0]["Période"]
+                                w1 = peaks.iloc[0]["Puissance relative"]
+                                st.info(
+                                    f"Cycle le plus marqué pour **{detail_label}** : **{p1}** "
+                                    f"(~{w1:.0%} de la puissance dans la bande analysée). "
+                                    "À interpréter comme une **tendance cyclique possible**, pas une règle stricte."
+                                )
+
+                _fft_interactive()
         elif vue == "Synthèse bon marché / cher":
             if HAS_ASSET_SUMMARY:
                 asset_summary.render_asset_summary_dashboard(
@@ -1996,6 +2423,12 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
 
         elif vue == "Suggestions d'actifs":
             st.header("💡 Suggestions d'actifs pour améliorer le portefeuille")
+            if suggestions_job.is_active():
+                st.info(
+                    "Génération en cours — vous pouvez consulter d'autres pages "
+                    "(ex. *Dividendes & Qualité*). Suivez la progression dans la "
+                    "**barre latérale** ; le résultat apparaîtra ici à la fin."
+                )
             st.caption(
                 "Compare votre portefeuille actuel à l'ajout simulé de chaque candidat "
                 "(poids configurable). Choisissez le **filtrage par seuils** ou le "
@@ -2053,24 +2486,21 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                     top_n = c3.slider("Nombre de suggestions affichées", 5, 30, 15, 1)
 
                     include_fundamentals = False
-                    min_piotroski = 0
-                    min_roe_pct = 0.0
-                    max_per_filter = None
-                    max_debt_equity_filter = None
+                    piotroski_lo = piotroski_hi = None
+                    roe_lo = roe_hi = None
+                    per_lo = per_hi = None
+                    debt_lo = debt_hi = None
                     include_technical = True
-                    max_rsi_filter = None
-                    min_rsi_filter = None
-                    max_bollinger_b_filter = None
-                    min_bollinger_b_filter = None
+                    rsi_lo = rsi_hi = None
+                    bb_lo = bb_hi = None
                     include_dividends = False
                     dividend_active_only = False
-                    min_yield_filter = None
-                    max_yield_filter = None
-                    min_coverage_filter = None
-                    min_cagr_filter = None
-                    min_growth_years_filter = None
-                    max_payout_filter = None
-                    max_fcf_payout_filter = None
+                    yield_lo = yield_hi = None
+                    coverage_lo = coverage_hi = None
+                    cagr_lo = cagr_hi = None
+                    growth_years_lo = growth_years_hi = None
+                    payout_lo = payout_hi = None
+                    fcf_payout_lo = fcf_payout_hi = None
                     if HAS_FUNDAMENTALS:
                         with st.expander(
                             "Indicateurs fondamentaux (qualité des entreprises)",
@@ -2089,55 +2519,45 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                                 key="sugg_include_fundamentals",
                             )
                             f1, f2, f3, f4 = st.columns(4)
-                            min_piotroski = f1.slider(
-                                "Score Piotroski min.",
+                            piotroski_lo, piotroski_hi = _suggestion_range_filter(
+                                f1,
+                                "Piotroski",
                                 0,
                                 9,
-                                0,
+                                (6, 9),
                                 1,
-                                help="0 = pas de filtre. ≥ 7 = entreprise financièrement solide.",
+                                key_prefix="sugg_piotroski",
+                                help="Score 0–9 · ≥ 7 = solide financièrement.",
                             )
-                            min_roe_pct = f2.slider(
-                                "ROE min. (%)",
+                            roe_lo, roe_hi = _suggestion_range_filter(
+                                f2,
+                                "ROE (%)",
                                 0.0,
                                 30.0,
-                                0.0,
+                                (10.0, 30.0),
                                 1.0,
-                                help="0 = pas de filtre. Ex. 15 % = rentabilité des capitaux propres.",
-                            ) / 100.0
-                            use_max_per = f3.checkbox(
-                                "Filtrer PER max.",
-                                value=False,
-                                key="sugg_use_max_per",
+                                key_prefix="sugg_roe",
+                                help="Rentabilité des capitaux propres.",
+                                scale=1 / 100.0,
                             )
-                            max_per_filter = (
-                                f3.number_input(
-                                    "PER max.",
-                                    min_value=1.0,
-                                    max_value=80.0,
-                                    value=25.0,
-                                    step=1.0,
-                                    disabled=not use_max_per,
-                                )
-                                if use_max_per
-                                else None
+                            per_lo, per_hi = _suggestion_range_filter(
+                                f3,
+                                "PER",
+                                1.0,
+                                80.0,
+                                (5.0, 25.0),
+                                1.0,
+                                key_prefix="sugg_per",
+                                help="PER > 0 uniquement (titres profitables).",
                             )
-                            use_max_debt = f4.checkbox(
-                                "Filtrer Dette / Capitaux max.",
-                                value=False,
-                                key="sugg_use_max_debt",
-                            )
-                            max_debt_equity_filter = (
-                                f4.number_input(
-                                    "Dette / Capitaux max.",
-                                    min_value=0.0,
-                                    max_value=5.0,
-                                    value=1.5,
-                                    step=0.1,
-                                    disabled=not use_max_debt,
-                                )
-                                if use_max_debt
-                                else None
+                            debt_lo, debt_hi = _suggestion_range_filter(
+                                f4,
+                                "Dette / Capitaux",
+                                0.0,
+                                5.0,
+                                (0.0, 1.5),
+                                0.1,
+                                key_prefix="sugg_debt",
                             )
                     elif not HAS_FUNDAMENTALS:
                         st.caption(
@@ -2158,78 +2578,26 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                             value=True,
                             key="sugg_include_technical",
                         )
-                        t1, t2, t3, t4 = st.columns(4)
-                        use_max_rsi = t1.checkbox(
-                            "Filtrer RSI max.",
-                            value=False,
-                            key="sugg_use_max_rsi",
-                            help="Ex. 65 = exclure les titres en surachat.",
+                        t1, t2 = st.columns(2)
+                        rsi_lo, rsi_hi = _suggestion_range_filter(
+                            t1,
+                            "RSI",
+                            10,
+                            90,
+                            (30, 65),
+                            1,
+                            key_prefix="sugg_rsi",
+                            help="Ex. 30–65 = hors zones extrêmes de surachat.",
                         )
-                        max_rsi_filter = (
-                            t1.slider(
-                                "RSI max.",
-                                30,
-                                90,
-                                65,
-                                1,
-                                disabled=not use_max_rsi,
-                            )
-                            if use_max_rsi
-                            else None
-                        )
-                        use_min_rsi = t2.checkbox(
-                            "Filtrer RSI min.",
-                            value=False,
-                            key="sugg_use_min_rsi",
-                            help="Ex. 35 = ne garder que les titres en zone de survente.",
-                        )
-                        min_rsi_filter = (
-                            t2.slider(
-                                "RSI min.",
-                                10,
-                                50,
-                                35,
-                                1,
-                                disabled=not use_min_rsi,
-                            )
-                            if use_min_rsi
-                            else None
-                        )
-                        use_max_bb = t3.checkbox(
-                            "Filtrer Bollinger %B max.",
-                            value=False,
-                            key="sugg_use_max_bb",
-                            help="Ex. 0,8 = exclure les titres proches de la bande haute.",
-                        )
-                        max_bollinger_b_filter = (
-                            t3.slider(
-                                "Bollinger %B max.",
-                                0.0,
-                                1.0,
-                                0.8,
-                                0.05,
-                                disabled=not use_max_bb,
-                            )
-                            if use_max_bb
-                            else None
-                        )
-                        use_min_bb = t4.checkbox(
-                            "Filtrer Bollinger %B min.",
-                            value=False,
-                            key="sugg_use_min_bb",
-                            help="Ex. 0,2 = ne garder que les titres proches de la bande basse.",
-                        )
-                        min_bollinger_b_filter = (
-                            t4.slider(
-                                "Bollinger %B min.",
-                                0.0,
-                                1.0,
-                                0.2,
-                                0.05,
-                                disabled=not use_min_bb,
-                            )
-                            if use_min_bb
-                            else None
+                        bb_lo, bb_hi = _suggestion_range_filter(
+                            t2,
+                            "Bollinger %B",
+                            0.0,
+                            1.0,
+                            (0.2, 0.8),
+                            0.05,
+                            key_prefix="sugg_bb",
+                            help="0 = bande basse · 1 = bande haute.",
                         )
 
                     if HAS_DIVIDENDES:
@@ -2256,132 +2624,65 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                                 help="Exclut les titres sans versement sur les 12 derniers mois.",
                             )
                             d1, d2, d3, d4 = st.columns(4)
-                            use_min_yield = d1.checkbox(
-                                "Filtrer rendement min.",
-                                value=False,
-                                key="sugg_use_min_yield",
+                            yield_lo, yield_hi = _suggestion_range_filter(
+                                d1,
+                                "rendement (%)",
+                                0.0,
+                                12.0,
+                                (2.0, 8.0),
+                                0.25,
+                                key_prefix="sugg_yield",
+                                scale=1 / 100.0,
                             )
-                            min_yield_filter = (
-                                d1.slider(
-                                    "Rendement min. (%)",
-                                    0.0,
-                                    12.0,
-                                    2.0,
-                                    0.25,
-                                    disabled=not use_min_yield,
-                                )
-                                / 100.0
-                                if use_min_yield
-                                else None
+                            coverage_lo, coverage_hi = _suggestion_range_filter(
+                                d2,
+                                "couverture (×)",
+                                0.5,
+                                5.0,
+                                (1.2, 5.0),
+                                0.1,
+                                key_prefix="sugg_coverage",
+                                help="Bénéfices ÷ dividendes (> 1 = couvert).",
                             )
-                            use_min_coverage = d2.checkbox(
-                                "Filtrer couverture min.",
-                                value=False,
-                                key="sugg_use_min_coverage",
+                            cagr_lo, cagr_hi = _suggestion_range_filter(
+                                d3,
+                                "CAGR 5 ans (%)",
+                                -10.0,
+                                20.0,
+                                (0.0, 15.0),
+                                0.5,
+                                key_prefix="sugg_cagr",
+                                scale=1 / 100.0,
                             )
-                            min_coverage_filter = (
-                                d2.number_input(
-                                    "Ratio couverture min. (×)",
-                                    min_value=0.5,
-                                    max_value=5.0,
-                                    value=1.2,
-                                    step=0.1,
-                                    disabled=not use_min_coverage,
-                                    help="Ex. 1,5 = le bénéfice couvre 1,5× le dividende versé.",
-                                )
-                                if use_min_coverage
-                                else None
+                            growth_years_lo, growth_years_hi = _suggestion_range_filter(
+                                d4,
+                                "années croissance",
+                                0,
+                                20,
+                                (3, 20),
+                                1,
+                                key_prefix="sugg_growth_years",
                             )
-                            use_min_cagr = d3.checkbox(
-                                "Filtrer croissance min.",
-                                value=False,
-                                key="sugg_use_min_cagr",
+                            d5, d6 = st.columns(2)
+                            payout_lo, payout_hi = _suggestion_range_filter(
+                                d5,
+                                "payout (%)",
+                                20.0,
+                                120.0,
+                                (20.0, 80.0),
+                                5.0,
+                                key_prefix="sugg_payout",
+                                scale=1 / 100.0,
                             )
-                            min_cagr_filter = (
-                                d3.slider(
-                                    "CAGR dividende 5 ans min. (%)",
-                                    -10.0,
-                                    20.0,
-                                    0.0,
-                                    0.5,
-                                    disabled=not use_min_cagr,
-                                )
-                                / 100.0
-                                if use_min_cagr
-                                else None
-                            )
-                            use_min_growth_years = d4.checkbox(
-                                "Filtrer années croissance min.",
-                                value=False,
-                                key="sugg_use_min_growth_years",
-                            )
-                            min_growth_years_filter = (
-                                d4.slider(
-                                    "Années de croissance min.",
-                                    0,
-                                    20,
-                                    3,
-                                    1,
-                                    disabled=not use_min_growth_years,
-                                )
-                                if use_min_growth_years
-                                else None
-                            )
-                            d5, d6, d7 = st.columns(3)
-                            use_max_payout = d5.checkbox(
-                                "Filtrer payout max.",
-                                value=False,
-                                key="sugg_use_max_payout",
-                            )
-                            max_payout_filter = (
-                                d5.slider(
-                                    "Payout max. (%)",
-                                    20.0,
-                                    120.0,
-                                    80.0,
-                                    5.0,
-                                    disabled=not use_max_payout,
-                                )
-                                / 100.0
-                                if use_max_payout
-                                else None
-                            )
-                            use_max_fcf_payout = d6.checkbox(
-                                "Filtrer FCF payout max.",
-                                value=False,
-                                key="sugg_use_max_fcf_payout",
-                            )
-                            max_fcf_payout_filter = (
-                                d6.slider(
-                                    "FCF payout max. (%)",
-                                    20.0,
-                                    150.0,
-                                    80.0,
-                                    5.0,
-                                    disabled=not use_max_fcf_payout,
-                                )
-                                / 100.0
-                                if use_max_fcf_payout
-                                else None
-                            )
-                            use_max_yield = d7.checkbox(
-                                "Filtrer rendement max.",
-                                value=False,
-                                key="sugg_use_max_yield",
-                            )
-                            max_yield_filter = (
-                                d7.slider(
-                                    "Rendement max. (%)",
-                                    2.0,
-                                    15.0,
-                                    8.0,
-                                    0.25,
-                                    disabled=not use_max_yield,
-                                    help="Exclut les rendements « trop beaux » (risque de trappe).",
-                                )
-                                / 100.0
-                                if use_max_yield
-                                else None
+                            fcf_payout_lo, fcf_payout_hi = _suggestion_range_filter(
+                                d6,
+                                "FCF payout (%)",
+                                20.0,
+                                150.0,
+                                (20.0, 80.0),
+                                5.0,
+                                key_prefix="sugg_fcf_payout",
+                                scale=1 / 100.0,
                             )
                     elif not HAS_DIVIDENDES:
                         st.caption(
@@ -2400,16 +2701,18 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                         ),
                     )
 
-                    min_candidate_return = None
-                    max_candidate_vol = None
-                    max_candidate_kurtosis = None
-                    min_candidate_skewness = None
-                    max_corr_portfolio = None
-                    min_delta_return = None
-                    min_delta_vol = None
-                    min_delta_kurtosis = None
-                    min_delta_skewness = None
-                    min_delta_corr_internal = None
+                    cand_return_lo = cand_return_hi = None
+                    cand_vol_lo = cand_vol_hi = None
+                    cand_kurt_lo = cand_kurt_hi = None
+                    cand_skew_lo = cand_skew_hi = None
+                    cand_sharpe_lo = cand_sharpe_hi = None
+                    corr_pf_lo = corr_pf_hi = None
+                    delta_return_lo = delta_return_hi = None
+                    delta_vol_lo = delta_vol_hi = None
+                    delta_kurt_lo = delta_kurt_hi = None
+                    delta_skew_lo = delta_skew_hi = None
+                    delta_sharpe_lo = delta_sharpe_hi = None
+                    delta_corr_lo = delta_corr_hi = None
 
                     if selection_mode == "Filtrage par seuils":
                         with st.expander(
@@ -2423,144 +2726,129 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                                 f"avec le poids réglé ci-dessus ({candidate_weight:.0%})."
                             )
                             st.markdown("**Propriétés du candidat**")
-                            s1, s2, s3, s4, s5 = st.columns(5)
-                            if s1.checkbox(
-                                "Rendement candidat min.",
-                                key="sugg_use_min_cand_return",
-                            ):
-                                min_candidate_return = (
-                                    s1.slider(
-                                        "Rendement min. (%)",
-                                        -20.0,
-                                        40.0,
-                                        5.0,
-                                        1.0,
-                                        key="sugg_min_cand_return",
-                                    )
-                                    / 100.0
-                                )
-                            if s2.checkbox(
-                                "Volatilité candidat max.",
-                                key="sugg_use_max_cand_vol",
-                            ):
-                                max_candidate_vol = (
-                                    s2.slider(
-                                        "Volatilité max. (%)",
-                                        5.0,
-                                        80.0,
-                                        25.0,
-                                        1.0,
-                                        key="sugg_max_cand_vol",
-                                    )
-                                    / 100.0
-                                )
-                            if s3.checkbox(
-                                "Kurtosis candidat max.",
-                                key="sugg_use_max_cand_kurt",
-                            ):
-                                max_candidate_kurtosis = s3.slider(
-                                    "Kurtosis max.",
-                                    0.0,
-                                    15.0,
-                                    5.0,
-                                    0.5,
-                                    key="sugg_max_cand_kurt",
-                                )
-                            if s4.checkbox(
-                                "Skewness candidat min.",
-                                key="sugg_use_min_cand_skew",
-                            ):
-                                min_candidate_skewness = s4.slider(
-                                    "Skewness min.",
-                                    -2.0,
-                                    2.0,
-                                    0.0,
-                                    0.1,
-                                    key="sugg_min_cand_skew",
-                                )
-                            if s5.checkbox(
-                                "Corrélation portef. max.",
-                                key="sugg_use_max_corr_cand",
-                            ):
-                                max_corr_portfolio = s5.slider(
-                                    "Corr. moy. max. (0–1)",
-                                    0.0,
-                                    1.0,
-                                    0.65,
-                                    0.05,
-                                    key="sugg_max_corr_cand",
-                                )
+                            s1, s2, s3 = st.columns(3)
+                            s4, s5, s6 = st.columns(3)
+                            cand_return_lo, cand_return_hi = _suggestion_range_filter(
+                                s1,
+                                "rendement candidat (%)",
+                                -20.0,
+                                40.0,
+                                (5.0, 40.0),
+                                1.0,
+                                key_prefix="sugg_cand_return",
+                                scale=1 / 100.0,
+                            )
+                            cand_vol_lo, cand_vol_hi = _suggestion_range_filter(
+                                s2,
+                                "volatilité candidat (%)",
+                                5.0,
+                                80.0,
+                                (5.0, 25.0),
+                                1.0,
+                                key_prefix="sugg_cand_vol",
+                                scale=1 / 100.0,
+                            )
+                            cand_kurt_lo, cand_kurt_hi = _suggestion_range_filter(
+                                s3,
+                                "kurtosis candidat",
+                                0.0,
+                                15.0,
+                                (0.0, 5.0),
+                                0.5,
+                                key_prefix="sugg_cand_kurt",
+                            )
+                            cand_skew_lo, cand_skew_hi = _suggestion_range_filter(
+                                s4,
+                                "skewness candidat",
+                                -2.0,
+                                2.0,
+                                (0.0, 2.0),
+                                0.1,
+                                key_prefix="sugg_cand_skew",
+                            )
+                            corr_pf_lo, corr_pf_hi = _suggestion_range_filter(
+                                s5,
+                                "corr. portefeuille",
+                                0.0,
+                                1.0,
+                                (0.0, 0.65),
+                                0.05,
+                                key_prefix="sugg_corr_pf",
+                                help="Corrélation moyenne avec le portefeuille (0–1).",
+                            )
+                            cand_sharpe_lo, cand_sharpe_hi = _suggestion_range_filter(
+                                s6,
+                                "Sharpe candidat",
+                                -1.0,
+                                3.0,
+                                (0.5, 3.0),
+                                0.1,
+                                key_prefix="sugg_cand_sharpe",
+                                help="Ratio de Sharpe annualisé du candidat seul.",
+                            )
                             st.markdown("**Impact simulé sur le portefeuille**")
-                            d1, d2, d3, d4, d5 = st.columns(5)
-                            if d1.checkbox(
-                                "Δ Rendement min.",
-                                key="sugg_use_min_delta_return",
-                            ):
-                                min_delta_return = (
-                                    d1.slider(
-                                        "Δ Rendement min. (pts %)",
-                                        -5.0,
-                                        10.0,
-                                        0.0,
-                                        0.5,
-                                        key="sugg_min_delta_return",
-                                    )
-                                    / 100.0
-                                )
-                            if d2.checkbox(
-                                "Δ Volatilité min.",
-                                key="sugg_use_min_delta_vol",
+                            d1, d2, d3 = st.columns(3)
+                            d4, d5, d6 = st.columns(3)
+                            delta_return_lo, delta_return_hi = _suggestion_range_filter(
+                                d1,
+                                "Δ rendement (pts %)",
+                                -5.0,
+                                10.0,
+                                (0.0, 10.0),
+                                0.5,
+                                key_prefix="sugg_delta_return",
+                                scale=1 / 100.0,
+                            )
+                            delta_vol_lo, delta_vol_hi = _suggestion_range_filter(
+                                d2,
+                                "Δ volatilité (pts %)",
+                                -10.0,
+                                10.0,
+                                (0.0, 10.0),
+                                0.5,
+                                key_prefix="sugg_delta_vol",
                                 help="Positif = le portefeuille devient moins volatile.",
-                            ):
-                                min_delta_vol = (
-                                    d2.slider(
-                                        "Δ Volatilité min. (pts %)",
-                                        -10.0,
-                                        10.0,
-                                        0.0,
-                                        0.5,
-                                        key="sugg_min_delta_vol",
-                                    )
-                                    / 100.0
-                                )
-                            if d3.checkbox(
-                                "Δ Kurtosis min.",
-                                key="sugg_use_min_delta_kurt",
+                                scale=1 / 100.0,
+                            )
+                            delta_kurt_lo, delta_kurt_hi = _suggestion_range_filter(
+                                d3,
+                                "Δ kurtosis",
+                                -5.0,
+                                5.0,
+                                (0.0, 5.0),
+                                0.25,
+                                key_prefix="sugg_delta_kurt",
                                 help="Positif = moins de risque de chutes brutales.",
-                            ):
-                                min_delta_kurtosis = d3.slider(
-                                    "Δ Kurtosis min.",
-                                    -5.0,
-                                    5.0,
-                                    0.0,
-                                    0.25,
-                                    key="sugg_min_delta_kurt",
-                                )
-                            if d4.checkbox(
-                                "Δ Skewness min.",
-                                key="sugg_use_min_delta_skew",
-                            ):
-                                min_delta_skewness = d4.slider(
-                                    "Δ Skewness min.",
-                                    -2.0,
-                                    2.0,
-                                    0.0,
-                                    0.1,
-                                    key="sugg_min_delta_skew",
-                                )
-                            if d5.checkbox(
-                                "Δ Corr. interne min.",
-                                key="sugg_use_min_delta_corr_int",
-                                help="Positif = les titres du portefeuille divergent davantage.",
-                            ):
-                                min_delta_corr_internal = d5.slider(
-                                    "Δ Corr. interne min.",
-                                    -0.5,
-                                    0.5,
-                                    0.0,
-                                    0.05,
-                                    key="sugg_min_delta_corr_int",
-                                )
+                            )
+                            delta_skew_lo, delta_skew_hi = _suggestion_range_filter(
+                                d4,
+                                "Δ skewness",
+                                -2.0,
+                                2.0,
+                                (0.0, 2.0),
+                                0.1,
+                                key_prefix="sugg_delta_skew",
+                            )
+                            delta_corr_lo, delta_corr_hi = _suggestion_range_filter(
+                                d5,
+                                "Δ corr. interne",
+                                -0.5,
+                                0.5,
+                                (0.0, 0.5),
+                                0.05,
+                                key_prefix="sugg_delta_corr",
+                                help="Positif = les titres divergent davantage.",
+                            )
+                            delta_sharpe_lo, delta_sharpe_hi = _suggestion_range_filter(
+                                d6,
+                                "Δ Sharpe",
+                                -1.0,
+                                2.0,
+                                (0.0, 2.0),
+                                0.05,
+                                key_prefix="sugg_delta_sharpe",
+                                help="Positif = le Sharpe du portefeuille simulé s'améliore.",
+                            )
                         objective_weights = dict(DEFAULT_SUGGESTION_OBJECTIVE_WEIGHTS)
                     else:
                         with st.expander("Poids des objectifs du score"):
@@ -2636,149 +2924,33 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                             "corr_candidate": w_corr_cand,
                         }
 
-                    run_suggestions = st.button("Générer les suggestions", type="primary")
+                    run_suggestions = st.button(
+                        "Générer les suggestions",
+                        type="primary",
+                        disabled=suggestions_job.is_active(),
+                    )
 
                     if run_suggestions:
-                        candidate_pool = []
-                        for universe in selected_universes:
-                            candidate_pool.extend(index_universe.get(universe, []))
-                        candidate_pool = [
-                            t for t in dict.fromkeys(candidate_pool)
-                            if t not in portfolio_tickers
-                        ][:max_candidates]
-
-                        if not candidate_pool:
-                            st.warning("Aucun candidat disponible dans les univers sélectionnés.")
+                        if not selected_universes:
+                            st.warning("Sélectionnez au moins un univers de candidats.")
                         else:
-                            with st.spinner(
-                                f"Téléchargement et analyse de {len(candidate_pool)} candidats..."
-                            ):
-                                candidate_sig = _tickers_signature(candidate_pool, start_date)
-                                candidate_prices, candidate_returns = cached_candidate_market_data(
-                                    candidate_sig,
-                                    tuple(candidate_pool),
-                                    str(start_date),
-                                )
-
-                            suggestions, baseline, baseline_internal = cached_suggest_portfolio_additions(
-                                ohlcv_sig,
-                                _tickers_signature(candidate_pool, start_date),
-                                returns,
-                                tuple(portfolio_tickers),
-                                candidate_returns,
-                                candidate_weight,
-                                tuple(sorted(objective_weights.items())),
+                            suggestions_job.start(
+                                {
+                                    "selected_universes": list(selected_universes),
+                                    "portfolio_tickers": list(portfolio_tickers),
+                                    "candidate_weight": candidate_weight,
+                                    "max_candidates": max_candidates,
+                                    "objective_weights": dict(objective_weights),
+                                    "include_fundamentals": include_fundamentals,
+                                    "include_technical": include_technical,
+                                    "include_dividends": include_dividends,
+                                    "selection_mode": selection_mode,
+                                    "start_date": str(start_date),
+                                    "ohlcv_sig": ohlcv_sig,
+                                    "json_path": JSON_PATH,
+                                }
                             )
-
-                            if (
-                                include_fundamentals
-                                and HAS_FUNDAMENTALS
-                                and not suggestions.empty
-                            ):
-                                cache_key = "suggestions_fundamentals_cache"
-                                fund_cache = st.session_state.setdefault(cache_key, {})
-                                status_fund = st.empty()
-                                progress_fund = st.progress(0)
-
-                                def _fund_progress(ticker, current, total, stats=None):
-                                    stats = stats or {}
-                                    if stats.get("fetched", 0) == 0 and (
-                                        stats.get("disk", 0) + stats.get("session", 0)
-                                    ) > 0:
-                                        label = "Fondamentaux (cache)"
-                                    else:
-                                        label = "Fondamentaux"
-                                    status_fund.text(
-                                        f"{label} : {ticker} ({current}/{total})"
-                                    )
-                                    progress_fund.progress(current / total)
-
-                                fund_rows, fund_cache, fund_stats = (
-                                    fundamentals.fetch_fundamentals_for_tickers(
-                                        suggestions["Ticker"].tolist(),
-                                        candidate_prices,
-                                        cache=fund_cache,
-                                        progress_cb=_fund_progress,
-                                    )
-                                )
-                                st.session_state[cache_key] = fund_cache
-                                suggestions = fundamentals.merge_fundamentals_columns(
-                                    suggestions, fund_rows
-                                )
-                                status_fund.empty()
-                                progress_fund.empty()
-                                st.caption(
-                                    "Fondamentaux — "
-                                    f"**{fund_stats['disk']}** depuis le disque · "
-                                    f"**{fund_stats['session']}** en session · "
-                                    f"**{fund_stats['fetched']}** téléchargés · "
-                                    f"**{fund_stats['missing']}** sans données. "
-                                    f"Cache : `{fundamentals._fundamentals_cache_path()}` (24 h)."
-                                )
-
-                            if include_technical and not suggestions.empty:
-                                suggestions = enrich_suggestions_with_technical(
-                                    suggestions, candidate_prices
-                                )
-
-                            if (
-                                include_dividends
-                                and HAS_DIVIDENDES
-                                and not suggestions.empty
-                            ):
-                                cache_key = "suggestions_dividends_cache"
-                                div_cache = st.session_state.setdefault(cache_key, {})
-                                status_div = st.empty()
-                                progress_div = st.progress(0)
-
-                                def _div_progress(ticker, current, total, stats=None):
-                                    stats = stats or {}
-                                    if stats.get("fetched", 0) == 0 and (
-                                        stats.get("disk", 0) + stats.get("session", 0)
-                                    ) > 0:
-                                        label = "Dividendes (cache)"
-                                    else:
-                                        label = "Dividendes"
-                                    status_div.text(
-                                        f"{label} : {ticker} ({current}/{total})"
-                                    )
-                                    progress_div.progress(current / total)
-
-                                div_rows, div_cache, div_stats = (
-                                    dividendes.fetch_dividends_for_tickers(
-                                        suggestions["Ticker"].tolist(),
-                                        candidate_prices,
-                                        cache=div_cache,
-                                        progress_cb=_div_progress,
-                                    )
-                                )
-                                st.session_state[cache_key] = div_cache
-                                suggestions = dividendes.merge_dividend_columns(
-                                    suggestions, div_rows
-                                )
-                                status_div.empty()
-                                progress_div.empty()
-                                st.caption(
-                                    "Dividendes — "
-                                    f"**{div_stats['disk']}** depuis le disque · "
-                                    f"**{div_stats['session']}** en session · "
-                                    f"**{div_stats['fetched']}** téléchargés · "
-                                    f"**{div_stats['missing']}** sans données. "
-                                    f"Cache : `{dividendes._dividends_cache_path()}` (24 h)."
-                                )
-
-                            st.session_state["portfolio_suggestions"] = suggestions
-                            st.session_state["portfolio_suggestions_baseline"] = baseline
-                            st.session_state["portfolio_suggestions_internal_corr"] = baseline_internal
-                            st.session_state["portfolio_suggestions_meta"] = {
-                                "pool_size": len(candidate_pool),
-                                "weight": candidate_weight,
-                                "weights": dict(objective_weights),
-                                "include_fundamentals": include_fundamentals,
-                                "include_technical": include_technical,
-                                "include_dividends": include_dividends,
-                                "selection_mode": selection_mode,
-                            }
+                            st.rerun()
 
                     if "portfolio_suggestions_baseline" in st.session_state:
                         baseline = st.session_state["portfolio_suggestions_baseline"]
@@ -2788,11 +2960,12 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                         meta = st.session_state.get("portfolio_suggestions_meta", {})
                         st.markdown("### Référence portefeuille actuel")
                         if baseline:
-                            b1, b2, b3, b4 = st.columns(4)
+                            b1, b2, b3, b4, b5 = st.columns(5)
                             b1.metric("Rendement annuel", f"{baseline['Rendement Annuel']:.2%}")
                             b2.metric("Volatilité", f"{baseline['Volatilité (Sigma)']:.2%}")
-                            b3.metric("Skewness", f"{baseline['Skewness (Asymétrie)']:.2f}")
-                            b4.metric("Corr. interne moy.", f"{baseline_internal:.2f}")
+                            b3.metric("Sharpe", f"{baseline.get('Ratio de Sharpe', 0):.2f}")
+                            b4.metric("Skewness", f"{baseline['Skewness (Asymétrie)']:.2f}")
+                            b5.metric("Corr. interne moy.", f"{baseline_internal:.2f}")
                         if meta:
                             st.caption(
                                 f"Candidats testés : {meta.get('pool_size', '?')} | "
@@ -2808,16 +2981,30 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                             before_stats = len(suggestions_view)
                             suggestions_view = filter_suggestions_by_statistics(
                                 suggestions_view,
-                                min_candidate_return=min_candidate_return,
-                                max_candidate_vol=max_candidate_vol,
-                                max_candidate_kurtosis=max_candidate_kurtosis,
-                                min_candidate_skewness=min_candidate_skewness,
-                                max_corr_portfolio=max_corr_portfolio,
-                                min_delta_return=min_delta_return,
-                                min_delta_vol=min_delta_vol,
-                                min_delta_kurtosis=min_delta_kurtosis,
-                                min_delta_skewness=min_delta_skewness,
-                                min_delta_corr_internal=min_delta_corr_internal,
+                                min_candidate_return=cand_return_lo,
+                                max_candidate_return=cand_return_hi,
+                                min_candidate_vol=cand_vol_lo,
+                                max_candidate_vol=cand_vol_hi,
+                                min_candidate_kurtosis=cand_kurt_lo,
+                                max_candidate_kurtosis=cand_kurt_hi,
+                                min_candidate_skewness=cand_skew_lo,
+                                max_candidate_skewness=cand_skew_hi,
+                                min_candidate_sharpe=cand_sharpe_lo,
+                                max_candidate_sharpe=cand_sharpe_hi,
+                                min_corr_portfolio=corr_pf_lo,
+                                max_corr_portfolio=corr_pf_hi,
+                                min_delta_return=delta_return_lo,
+                                max_delta_return=delta_return_hi,
+                                min_delta_vol=delta_vol_lo,
+                                max_delta_vol=delta_vol_hi,
+                                min_delta_kurtosis=delta_kurt_lo,
+                                max_delta_kurtosis=delta_kurt_hi,
+                                min_delta_skewness=delta_skew_lo,
+                                max_delta_skewness=delta_skew_hi,
+                                min_delta_sharpe=delta_sharpe_lo,
+                                max_delta_sharpe=delta_sharpe_hi,
+                                min_delta_corr_internal=delta_corr_lo,
+                                max_delta_corr_internal=delta_corr_hi,
                             )
                             if len(suggestions_view) < before_stats:
                                 filter_parts.append("statistiques")
@@ -2828,10 +3015,14 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                         ):
                             suggestions_view = fundamentals.filter_suggestions_by_quality(
                                 suggestions_view,
-                                min_piotroski=min_piotroski,
-                                min_roe=min_roe_pct,
-                                max_per=max_per_filter,
-                                max_debt_equity=max_debt_equity_filter,
+                                min_piotroski=piotroski_lo,
+                                max_piotroski=piotroski_hi,
+                                min_roe=roe_lo,
+                                max_roe=roe_hi,
+                                min_per=per_lo,
+                                max_per=per_hi,
+                                min_debt_equity=debt_lo,
+                                max_debt_equity=debt_hi,
                             )
                             if len(suggestions_view) < len(suggestions):
                                 filter_parts.append("fondamentaux")
@@ -2843,10 +3034,10 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                             before_technical = len(suggestions_view)
                             suggestions_view = filter_suggestions_by_technical(
                                 suggestions_view,
-                                max_rsi=max_rsi_filter,
-                                min_rsi=min_rsi_filter,
-                                max_bollinger_b=max_bollinger_b_filter,
-                                min_bollinger_b=min_bollinger_b_filter,
+                                min_rsi=rsi_lo,
+                                max_rsi=rsi_hi,
+                                min_bollinger_b=bb_lo,
+                                max_bollinger_b=bb_hi,
                             )
                             if len(suggestions_view) < before_technical:
                                 filter_parts.append("techniques")
@@ -2858,13 +3049,18 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                             before_dividends = len(suggestions_view)
                             suggestions_view = dividendes.filter_suggestions_by_dividends(
                                 suggestions_view,
-                                min_yield=min_yield_filter,
-                                max_yield=max_yield_filter,
-                                min_coverage=min_coverage_filter,
-                                min_cagr_5y=min_cagr_filter,
-                                min_growth_years=min_growth_years_filter,
-                                max_payout=max_payout_filter,
-                                max_fcf_payout=max_fcf_payout_filter,
+                                min_yield=yield_lo,
+                                max_yield=yield_hi,
+                                min_coverage=coverage_lo,
+                                max_coverage=coverage_hi,
+                                min_cagr_5y=cagr_lo,
+                                max_cagr_5y=cagr_hi,
+                                min_growth_years=growth_years_lo,
+                                max_growth_years=growth_years_hi,
+                                min_payout=payout_lo,
+                                max_payout=payout_hi,
+                                min_fcf_payout=fcf_payout_lo,
+                                max_fcf_payout=fcf_payout_hi,
                                 active_only=dividend_active_only,
                             )
                             if len(suggestions_view) < before_dividends:
@@ -2942,8 +3138,10 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                             if "Ticker" in display_df.columns and (
                                 show_company_names or need_ticker_sectors
                             ):
-                                sugg_names, sugg_sectors = get_ticker_metadata(
+                                sugg_names, sugg_sectors = _resolve_ticker_metadata(
                                     display_df["Ticker"].tolist(),
+                                    ticker_names,
+                                    ticker_sectors,
                                     need_names=show_company_names,
                                     need_sectors=need_ticker_sectors,
                                 )
@@ -3033,8 +3231,10 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                             st.markdown("### Visualisation des compromis")
                             plot_df = suggestions_view.head(min(50, len(suggestions_view))).copy()
                             if show_company_names and "Ticker" in plot_df.columns:
-                                plot_names, _ = get_ticker_metadata(
+                                plot_names, _ = _resolve_ticker_metadata(
                                     plot_df["Ticker"].tolist(),
+                                    ticker_names,
+                                    ticker_sectors,
                                     need_names=True,
                                     need_sectors=False,
                                 )
@@ -3043,19 +3243,20 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                                 )
                             score_min = plot_df["Score composite"].min()
                             plot_df["Taille score"] = plot_df["Score composite"] - score_min + 0.01
-                            fig_sugg = px.scatter(
+                            fig_sugg = build_suggestions_tradeoff_scatter(
                                 plot_df,
-                                x="Corr. moy. portefeuille",
-                                y="Rendement candidat",
-                                size="Taille score",
-                                color="Score composite",
-                                hover_name="Libellé" if show_company_names and "Libellé" in plot_df.columns else "Ticker",
-                                color_continuous_scale="RdYlGn",
-                                title="Rendement vs diversification (corrélation au portefeuille)",
+                                label_col=(
+                                    "Libellé"
+                                    if show_company_names and "Libellé" in plot_df.columns
+                                    else "Ticker"
+                                ),
                             )
-                            fig_sugg.update_yaxes(tickformat=".0%")
-                            fig_sugg.update_layout(coloraxis_colorbar_title="Score composite")
-                            st.plotly_chart(fig_sugg, use_container_width=True)
+                            if fig_sugg is not None:
+                                st.plotly_chart(fig_sugg, use_container_width=True)
+                                st.caption(
+                                    "Survolez les points pour le détail — "
+                                    "bas à gauche = diversifiant et performant."
+                                )
 
                             csv_sugg = suggestions_view.to_csv(index=False).encode("utf-8")
                             st.download_button(
@@ -3063,8 +3264,35 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
                                 csv_sugg,
                                 "suggestions_actifs.csv",
                             )
-                    elif run_suggestions:
-                        st.warning("Aucune suggestion pertinente n'a pu être calculée.")
+                    job_state = st.session_state.get("suggestions_job")
+                    if job_state and job_state.get("status") == "error":
+                        st.error(f"Échec : {job_state.get('error', 'erreur inconnue')}")
+                    meta = st.session_state.get("portfolio_suggestions_meta") or {}
+                    if meta.get("fund_stats"):
+                        fs = meta["fund_stats"]
+                        st.caption(
+                            "Fondamentaux — "
+                            f"**{fs.get('disk', 0)}** disque · "
+                            f"**{fs.get('session', 0)}** session · "
+                            f"**{fs.get('fetched', 0)}** téléchargés · "
+                            f"**{fs.get('missing', 0)}** sans données."
+                        )
+                    if meta.get("div_stats"):
+                        ds = meta["div_stats"]
+                        st.caption(
+                            "Dividendes — "
+                            f"**{ds.get('disk', 0)}** disque · "
+                            f"**{ds.get('session', 0)}** session · "
+                            f"**{ds.get('fetched', 0)}** téléchargés · "
+                            f"**{ds.get('missing', 0)}** sans données."
+                        )
 
 
+if vue == "Dividendes & Qualité" and HAS_DIVIDENDES:
+    pf_tickers = sorted({str(t).strip() for t in liste_tickers}) if liste_tickers else None
+    with st.expander("Univers dividendes — tickers.json (5000 actions)", expanded=True):
+        dividendes.render_dividend_universe_builder(portfolio_tickers=pf_tickers)
+    st.markdown("---")
+
+suggestions_job.render_sidebar_status()
 render_live_dashboard()

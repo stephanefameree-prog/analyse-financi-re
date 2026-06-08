@@ -32,7 +32,7 @@ except ImportError:
     HAS_FAIR_VALUE = False
 
 # Incrémenter si la logique de prédiction fair_value change (invalide le cache Streamlit).
-FAIR_VALUE_ENGINE_VERSION = 38
+FAIR_VALUE_ENGINE_VERSION = 39
 FAIR_VALUE_COLUMNS = (
     "Juste valeur estimée",
     "Écart juste valeur",
@@ -81,6 +81,7 @@ FUNDAMENTALS_TEXT_COLUMNS = frozenset({
 
 FUNDAMENTALS_DISK_CACHE_FILE = "fundamentals_cache.json"
 DISK_CACHE_TTL_SECONDS = 86400
+_FUNDAMENTALS_DISK_STORE = None
 
 
 def _fundamentals_cache_path():
@@ -88,24 +89,39 @@ def _fundamentals_cache_path():
 
 
 def _load_fundamentals_disk_store():
+    global _FUNDAMENTALS_DISK_STORE
+    if _FUNDAMENTALS_DISK_STORE is not None:
+        return _FUNDAMENTALS_DISK_STORE
     path = _fundamentals_cache_path()
     if not path.is_file():
-        return {"version": 1, "portfolios": {}}
+        _FUNDAMENTALS_DISK_STORE = {"version": 1, "portfolios": {}, "tickers": {}}
+        return _FUNDAMENTALS_DISK_STORE
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict) and isinstance(data.get("portfolios"), dict):
             data.setdefault("tickers", {})
-            return data
+            _FUNDAMENTALS_DISK_STORE = data
+            return _FUNDAMENTALS_DISK_STORE
     except Exception:
         pass
-    return {"version": 1, "portfolios": {}, "tickers": {}}
+    _FUNDAMENTALS_DISK_STORE = {"version": 1, "portfolios": {}, "tickers": {}}
+    return _FUNDAMENTALS_DISK_STORE
 
 
 def _save_fundamentals_disk_store(data):
+    global _FUNDAMENTALS_DISK_STORE
+    _FUNDAMENTALS_DISK_STORE = data
     path = _fundamentals_cache_path()
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = path.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+    tmp.replace(path)
+
+
+def _invalidate_fundamentals_disk_cache():
+    global _FUNDAMENTALS_DISK_STORE
+    _FUNDAMENTALS_DISK_STORE = None
 
 
 def load_fundamentals_rows_from_disk(ticker_signature):
@@ -164,6 +180,7 @@ def clear_fundamentals_disk_cache(ticker_signature=None):
         path = _fundamentals_cache_path()
         if path.is_file():
             path.unlink()
+        _invalidate_fundamentals_disk_cache()
         return
     store = _load_fundamentals_disk_store()
     portfolios = store.get("portfolios", {})
@@ -455,14 +472,15 @@ def _build_yearly_ratios(inc, bs, cf, max_years=5):
     return yearly
 
 
-def compute_profitability_indicators(ticker):
+def compute_profitability_indicators(ticker, ctx=None):
     """Indicateurs rentabilité / efficacité (capture Investing.com / BFM)."""
     metrics = {}
     try:
-        t = Ticker(ticker, timeout=25)
-        inc = _prep_annual_statement(t.income_statement(frequency="a"), ticker)
-        bs = _prep_annual_statement(t.balance_sheet(frequency="a"), ticker)
-        cf = _prep_annual_statement(t.cash_flow(frequency="a"), ticker)
+        if ctx is None:
+            ctx = _build_yahoo_fundamentals_context(ticker)
+        inc = ctx.get("inc_a", pd.DataFrame())
+        bs = ctx.get("bs_a", pd.DataFrame())
+        cf = ctx.get("cf_a", pd.DataFrame())
 
         yearly = _build_yearly_ratios(inc, bs, cf, max_years=5)
 
@@ -490,7 +508,7 @@ def compute_profitability_indicators(ticker):
             if len(yearly) >= 2:
                 metrics["Score Piotroski"] = _piotroski_score(yearly[0], yearly[1])
 
-        info = yf.Ticker(ticker).info or {}
+        info = ctx.get("info") or {}
         employees = _safe_float(info.get("fullTimeEmployees"))
         if employees and employees > 0:
             rev = _safe_float(info.get("totalRevenue")) or (yearly[0].get("revenue") if yearly else None)
@@ -528,22 +546,17 @@ def _growth_as_decimal(value):
     return g
 
 
-def compute_valuation_indicators(ticker, last_price=None):
+def compute_valuation_indicators(ticker, last_price=None, ctx=None):
     """Multiples et rendements de valorisation (capture BFM / Investing)."""
     metrics = {}
     try:
-        info = yf.Ticker(ticker).info or {}
+        if ctx is None:
+            ctx = _build_yahoo_fundamentals_context(ticker)
+        info = ctx.get("info") or {}
         metrics["Secteur Yahoo"] = info.get("sector") or None
         metrics["Industrie Yahoo"] = info.get("industry") or None
-        t = Ticker(ticker, timeout=25)
-        ks = t.key_stats
-        fd = t.financial_data
-        if isinstance(ks, dict) and ticker in ks:
-            ks = ks[ticker]
-        if isinstance(fd, dict) and ticker in fd:
-            fd = fd[ticker]
-        ks = ks if isinstance(ks, dict) else {}
-        fd = fd if isinstance(fd, dict) else {}
+        ks = ctx.get("ks") or {}
+        fd = ctx.get("fd") or {}
 
         lp = _safe_float(last_price) or _safe_float(
             info.get("currentPrice") or info.get("regularMarketPrice") or fd.get("currentPrice")
@@ -570,8 +583,8 @@ def compute_valuation_indicators(ticker, last_price=None):
         shares = _safe_float(info.get("sharesOutstanding"))
         growth = _growth_as_decimal(fd.get("earningsGrowth") or info.get("earningsGrowth"))
 
-        inc = _prep_annual_statement(t.income_statement(frequency="a"), ticker)
-        bs = _prep_annual_statement(t.balance_sheet(frequency="a"), ticker)
+        inc = ctx.get("inc_a", pd.DataFrame())
+        bs = ctx.get("bs_a", pd.DataFrame())
 
         metrics["Capitalisation de marché"] = market_cap
         metrics["PER"] = per
@@ -616,6 +629,14 @@ def compute_valuation_indicators(ticker, last_price=None):
         div_yield = _normalize_yahoo_pct(
             info.get("dividendYield") or info.get("trailingAnnualDividendYield")
         )
+        metrics["Rendement dividende"] = div_yield
+        div_rate = _safe_float(
+            info.get("trailingAnnualDividendRate") or info.get("dividendRate")
+        )
+        if div_rate is not None:
+            metrics["Dividende / action"] = div_rate
+        elif div_yield is not None and lp:
+            metrics["Dividende / action"] = div_yield * lp
         buyback_yield = None
         if len(inc) >= 2:
             sh_cur = _row_get(inc.iloc[0], "DilutedAverageShares", "BasicAverageShares")
@@ -664,10 +685,12 @@ def compute_valuation_indicators(ticker, last_price=None):
     return metrics
 
 
-def get_fundamentals_yfinance(ticker):
+def get_fundamentals_yfinance(ticker, ctx=None):
+    if ctx is None:
+        ctx = _build_yahoo_fundamentals_context(ticker)
     data = {}
     try:
-        info = yf.Ticker(ticker).info or {}
+        info = ctx.get("info") or {}
         data["per"] = _safe_float(info.get("trailingPE"))
         data["per_forward"] = _safe_float(info.get("forwardPE"))
         data["debt_to_equity"] = _safe_float(info.get("debtToEquity"))
@@ -682,8 +705,8 @@ def get_fundamentals_yfinance(ticker):
         if total_debt is not None and fcf not in (None, 0):
             data["debt_fcf"] = total_debt / abs(fcf)
         else:
-            bs = yf.Ticker(ticker).balance_sheet
-            cf = yf.Ticker(ticker).cashflow
+            bs = ctx.get("yf_bs")
+            cf = ctx.get("yf_cf")
             if bs is not None and not bs.empty:
                 total_debt = _find_row_value(
                     bs, ["total debt", "long term debt", "total liabilities"]
@@ -704,31 +727,25 @@ def get_fundamentals_yfinance(ticker):
     return data
 
 
-def get_fundamentals_yahooquery(ticker):
+def get_fundamentals_yahooquery(ticker, ctx=None):
+    if ctx is None:
+        ctx = _build_yahoo_fundamentals_context(ticker)
     data = {}
     try:
-        t = Ticker(ticker, timeout=20)
-        ks = t.key_stats
-        if isinstance(ks, dict) and ticker in ks:
-            ks = ks[ticker]
-        if isinstance(ks, dict):
-            data["per"] = _safe_float(ks.get("trailingPE"))
-            data["per_forward"] = _safe_float(ks.get("forwardPE"))
-            data["debt_to_equity"] = _safe_float(ks.get("debtToEquity"))
+        ks = ctx.get("ks") or {}
+        data["per"] = _safe_float(ks.get("trailingPE"))
+        data["per_forward"] = _safe_float(ks.get("forwardPE"))
+        data["debt_to_equity"] = _safe_float(ks.get("debtToEquity"))
 
-        fd = t.financial_data
-        if isinstance(fd, dict) and ticker in fd:
-            fd = fd[ticker]
-        if isinstance(fd, dict):
-            data["target_mean"] = _safe_float(fd.get("targetMeanPrice"))
-            data["target_low"] = _safe_float(fd.get("targetLowPrice"))
-            data["target_high"] = _safe_float(fd.get("targetHighPrice"))
-            data["recommendation"] = fd.get("recommendationKey")
-            data["analyst_count"] = _safe_float(fd.get("numberOfAnalystOpinions"))
+        fd = ctx.get("fd") or {}
+        data["target_mean"] = _safe_float(fd.get("targetMeanPrice"))
+        data["target_low"] = _safe_float(fd.get("targetLowPrice"))
+        data["target_high"] = _safe_float(fd.get("targetHighPrice"))
+        data["recommendation"] = fd.get("recommendationKey")
+        data["analyst_count"] = _safe_float(fd.get("numberOfAnalystOpinions"))
 
-        inc = t.income_statement(frequency="a")
-        bs = t.balance_sheet(frequency="a")
-        cf = t.cash_flow(frequency="a")
+        bs = ctx.get("bs_raw")
+        cf = ctx.get("cf_raw")
         if isinstance(bs, pd.DataFrame) and not bs.empty:
             bs = bs.sort_index()
             total_debt = _find_row_value(
@@ -843,11 +860,7 @@ def compute_market_indicators(ticker, price_series=None, last_price=None):
     Indicateurs marché / technique (capture BFM) : cours, 52 sem., MA, float, volatilité.
     """
     metrics = {}
-    info = {}
-    try:
-        info = yf.Ticker(ticker).info or {}
-    except Exception:
-        pass
+    info = _cached_yahoo_info(str(ticker)) if ticker else {}
 
     lp = _safe_float(last_price)
     if lp is None:
@@ -982,16 +995,64 @@ def _refresh_market_fields_from_prices(row, price_series, last_price=None, ticke
     return row
 
 
+def _build_yahoo_fundamentals_context(ticker):
+    """Charge une fois par ticker : info Yahoo, yahooquery et états financiers."""
+    ticker = str(ticker)
+    ctx = {
+        "ticker": ticker,
+        "info": _cached_yahoo_info(ticker),
+        "ks": {},
+        "fd": {},
+        "inc_a": pd.DataFrame(),
+        "bs_a": pd.DataFrame(),
+        "cf_a": pd.DataFrame(),
+        "inc_raw": None,
+        "bs_raw": None,
+        "cf_raw": None,
+        "yf_bs": None,
+        "yf_cf": None,
+    }
+    try:
+        t = Ticker(ticker, timeout=25)
+        ks = t.key_stats
+        if isinstance(ks, dict) and ticker in ks:
+            ks = ks[ticker]
+        ctx["ks"] = ks if isinstance(ks, dict) else {}
+        fd = t.financial_data
+        if isinstance(fd, dict) and ticker in fd:
+            fd = fd[ticker]
+        ctx["fd"] = fd if isinstance(fd, dict) else {}
+        inc_raw = t.income_statement(frequency="a")
+        bs_raw = t.balance_sheet(frequency="a")
+        cf_raw = t.cash_flow(frequency="a")
+        ctx["inc_raw"] = inc_raw
+        ctx["bs_raw"] = bs_raw
+        ctx["cf_raw"] = cf_raw
+        ctx["inc_a"] = _prep_annual_statement(inc_raw, ticker)
+        ctx["bs_a"] = _prep_annual_statement(bs_raw, ticker)
+        ctx["cf_a"] = _prep_annual_statement(cf_raw, ticker)
+    except Exception:
+        pass
+    try:
+        yf_t = yf.Ticker(ticker)
+        ctx["yf_bs"] = yf_t.balance_sheet
+        ctx["yf_cf"] = yf_t.cashflow
+    except Exception:
+        pass
+    return ctx
+
+
 def fetch_fundamentals_for_ticker(ticker, last_price, price_series=None, throttle=True):
     if throttle:
         time.sleep(random.uniform(0.2, 0.5))
-    yf_data = get_fundamentals_yfinance(ticker)
-    yq_data = get_fundamentals_yahooquery(ticker)
+    ctx = _build_yahoo_fundamentals_context(ticker)
+    yf_data = get_fundamentals_yfinance(ticker, ctx=ctx)
+    yq_data = get_fundamentals_yahooquery(ticker, ctx=ctx)
     data = merge_fundamentals(yf_data, yq_data)
-    profitability = compute_profitability_indicators(ticker)
+    profitability = compute_profitability_indicators(ticker, ctx=ctx)
     market = compute_market_indicators(ticker, price_series=price_series, last_price=last_price)
     lp = market.get("Dernier cours") or last_price
-    valuation = compute_valuation_indicators(ticker, lp)
+    valuation = compute_valuation_indicators(ticker, lp, ctx=ctx)
 
     if (
         not data
@@ -1068,6 +1129,8 @@ def fetch_fundamentals_for_ticker(ticker, last_price, price_series=None, throttl
         "PEG forward": valuation.get("PEG forward"),
         "VE/EBITDA forward": valuation.get("VE/EBITDA forward"),
         "Rendement bénéfices": valuation.get("Rendement bénéfices"),
+        "Rendement dividende": valuation.get("Rendement dividende"),
+        "Dividende / action": valuation.get("Dividende / action"),
         "Rendement actionnaire": valuation.get("Rendement actionnaire"),
         "Rendement rachat": valuation.get("Rendement rachat"),
         "Rendement FCF": valuation.get("Rendement FCF"),
@@ -1245,6 +1308,44 @@ _FUNDAMENTALS_SENTIMENT_COLUMNS = expand_sentiment_columns(
 _FAIR_VALUE_SENTIMENT_COLUMNS = frozenset(FAIR_VALUE_COLUMNS)
 
 
+def _numeric_upside_sentiment(val) -> str:
+    """Vert si valeur > 0 (sous-évalué), rouge si < 0 (surévalué)."""
+    v = _safe_float(val)
+    if v is None:
+        return ""
+    if v > 0:
+        return _STYLE_FAVORABLE
+    if v < 0:
+        return _STYLE_UNFAVORABLE
+    return ""
+
+
+def _price_vs_course_sentiment(implied_price, course) -> str:
+    """Vert si prix implicite / JV > cours, rouge si < cours."""
+    jv = _safe_float(implied_price)
+    px = _safe_float(course)
+    if jv is None or px is None or px <= 0:
+        return ""
+    if jv > px:
+        return _STYLE_FAVORABLE
+    if jv < px:
+        return _STYLE_UNFAVORABLE
+    return ""
+
+
+def _damodaran_column_sentiment(row, column: str, val=None) -> str:
+    """Couleur des colonnes Damodaran selon la cellule (ou upside associé)."""
+    if column == "Upside Damodaran":
+        cell = val if val is not None else row.get(column)
+        return _numeric_upside_sentiment(cell)
+    if column == "Juste valeur Damodaran":
+        cell = val if val is not None else row.get(column)
+        return _price_vs_course_sentiment(cell, row.get("Dernier cours"))
+    if column == "Profil Damodaran":
+        return _numeric_upside_sentiment(row.get("Upside Damodaran"))
+    return ""
+
+
 def _fair_value_label_sentiment(val) -> str:
     """Vert = sous-évalué (Aubaine / Sous-évaluée), rouge = surévalué."""
     text = str(val).strip().lower()
@@ -1257,35 +1358,27 @@ def _fair_value_label_sentiment(val) -> str:
     return ""
 
 
-def _fair_value_cell_sentiment(row, column: str) -> str:
-    """Vert si favorable à une hausse (JV > cours), rouge sinon."""
+def _fair_value_cell_sentiment(row, column: str, val=None) -> str:
+    """Vert si sous-évalué selon la valeur de la cellule, rouge si surévalué."""
     column = internal_column_name(column, FUNDAMENTALS_LABELS)
+    if val is None and hasattr(row, "get"):
+        val = row.get(column)
+
     if column == "Libellé juste valeur":
-        return _fair_value_label_sentiment(row.get(column))
+        return _fair_value_label_sentiment(val)
 
-    if column == "Upside Damodaran":
-        up_d = _safe_float(row.get("Upside Damodaran"))
-        if up_d is not None:
-            if up_d > 0:
-                return _STYLE_FAVORABLE
-            if up_d < 0:
-                return _STYLE_UNFAVORABLE
-            return ""
+    if column in DAMODARAN_COLUMNS:
+        return _damodaran_column_sentiment(row, column, val)
 
-    upside = _safe_float(row.get("Upside juste valeur"))
-    if upside is not None:
-        if upside > 0:
-            return _STYLE_FAVORABLE
-        if upside < 0:
-            return _STYLE_UNFAVORABLE
-        return ""
+    if column == "Upside juste valeur":
+        return _numeric_upside_sentiment(val)
+    if column == "Écart juste valeur":
+        return _numeric_upside_sentiment(val)
+    if column == "Juste valeur estimée":
+        return _price_vs_course_sentiment(val, row.get("Dernier cours"))
+    if column == "Modèle juste valeur":
+        return _numeric_upside_sentiment(row.get("Upside juste valeur"))
 
-    ecart = _safe_float(row.get("Écart juste valeur"))
-    if ecart is not None:
-        if ecart > 0:
-            return _STYLE_FAVORABLE
-        if ecart < 0:
-            return _STYLE_UNFAVORABLE
     return ""
 
 
@@ -1310,13 +1403,11 @@ def _fundamentals_metric_sentiment(column, val, row=None):
             return _fair_value_cell_sentiment(row, column)
         if column == "Libellé juste valeur":
             return _fair_value_label_sentiment(val)
-        v = _safe_float(val)
-        if v is not None:
-            if v > 0:
-                return _STYLE_FAVORABLE
-            if v < 0:
-                return _STYLE_UNFAVORABLE
-        return ""
+        if column in DAMODARAN_COLUMNS:
+            if column == "Juste valeur Damodaran":
+                return ""
+            return _numeric_upside_sentiment(val)
+        return _numeric_upside_sentiment(val)
     v = _safe_float(val)
     if v is None:
         return ""
@@ -1723,7 +1814,8 @@ def _style_fundamentals_sentiment(styler, df_raw=None):
             and len(df_raw) == len(series)
         ):
             return [
-                _fair_value_cell_sentiment(df_raw.iloc[i], internal) for i in range(len(series))
+                _fair_value_cell_sentiment(df_raw.iloc[i], internal, val=series.iloc[i])
+                for i in range(len(series))
             ]
 
         if series.name not in _FUNDAMENTALS_SENTIMENT_COLUMNS:
@@ -1812,22 +1904,40 @@ def merge_fundamentals_columns(df, fundamentals_rows, columns=None):
 def filter_suggestions_by_quality(
     df,
     min_piotroski=0,
-    min_roe=0.0,
+    max_piotroski=None,
+    min_roe=None,
+    max_roe=None,
+    min_per=None,
     max_per=None,
+    min_debt_equity=None,
     max_debt_equity=None,
 ):
     """Filtre les suggestions selon des seuils de qualité fondamentale."""
     if df is None or df.empty:
         return df
     out = df.copy()
-    if min_piotroski > 0 and "Score Piotroski" in out.columns:
+    if min_piotroski is not None and "Score Piotroski" in out.columns:
         out = out[out["Score Piotroski"].fillna(-1) >= min_piotroski]
-    if min_roe > 0 and "ROE" in out.columns:
+    if max_piotroski is not None and "Score Piotroski" in out.columns:
+        out = out[out["Score Piotroski"].fillna(999) <= max_piotroski]
+    if min_roe is not None and "ROE" in out.columns:
         out = out[out["ROE"].fillna(-1) >= min_roe]
+    if max_roe is not None and "ROE" in out.columns:
+        out = out[out["ROE"].isna() | (out["ROE"] <= max_roe)]
+    if min_per is not None and "PER" in out.columns:
+        out = out[
+            out["PER"].isna()
+            | ((out["PER"] > 0) & (out["PER"] >= min_per))
+        ]
     if max_per is not None and "PER" in out.columns:
         out = out[
             out["PER"].isna()
             | ((out["PER"] > 0) & (out["PER"] <= max_per))
+        ]
+    if min_debt_equity is not None and "Dette / Capitaux" in out.columns:
+        out = out[
+            out["Dette / Capitaux"].isna()
+            | (out["Dette / Capitaux"] >= min_debt_equity)
         ]
     if max_debt_equity is not None and "Dette / Capitaux" in out.columns:
         out = out[
@@ -1922,8 +2032,11 @@ Les cellules sont colorées automatiquement selon des **seuils indicatifs** (à 
 | Upside vs objectif | ≥ +10 % | < 0 % |
 | Upside juste valeur | > 0 % (JV > cours) | < 0 % (JV < cours) |
 | Écart juste valeur | > 0 (JV > cours) | < 0 (JV < cours) |
-| Libellé juste valeur | Aubaine / Sous-évaluée | Surévaluée |
 | Juste valeur estimée | JV > cours | JV < cours |
+| Juste valeur Damodaran | JV Damodaran > cours | JV Damodaran < cours |
+| Upside Damodaran | > 0 % | < 0 % |
+| Profil Damodaran | *(même signal que Upside Damodaran)* | idem |
+| Libellé juste valeur | Aubaine / Sous-évaluée | Surévaluée |
 | Var. journalière | ≥ +1 % | ≤ −1 % |
 | Var. vs sommet 52 sem. | ≤ −15 % (éloigné du plus haut) | ≥ −2 % (proche du plus haut) |
 | Var. vs creux 52 sem. | ≥ +30 % | ≤ +5 % (proche du plus bas) |
@@ -2214,10 +2327,80 @@ def build_valuation_upside_radar(row, ticker_label: str):
                 tickformat=".0%",
             ),
         ),
-        title=f"Comparaison des upsides — {ticker_label}",
         showlegend=False,
-        height=460,
         margin=dict(t=70, b=70, l=100, r=100),
+    )
+    try:
+        from chart_theme import CHART_HEIGHT, apply_chart_theme
+
+        apply_chart_theme(
+            fig,
+            height=CHART_HEIGHT.get("radar", 460),
+            title=f"Comparaison des upsides — {ticker_label}",
+            legend_horizontal=False,
+        )
+    except ImportError:
+        fig.update_layout(
+            title=f"Comparaison des upsides — {ticker_label}",
+            height=460,
+        )
+    return fig
+
+
+def build_fair_value_gauge_figure(
+    price,
+    fair_value,
+    *,
+    ticker_label="Actif",
+    title=None,
+):
+    """Jauge cours vs juste valeur estimée (repère vert = JV)."""
+    from chart_theme import CHART_HEIGHT, apply_chart_theme
+
+    price_f = _safe_float(price)
+    jv_f = _safe_float(fair_value)
+    if price_f is None or jv_f is None or price_f <= 0 or jv_f <= 0:
+        return None
+
+    lo = min(price_f, jv_f) * 0.88
+    hi = max(price_f, jv_f) * 1.12
+    mid = (lo + hi) / 2.0
+    green_lo = min(lo, jv_f * 0.95)
+    green_hi = max(mid, jv_f * 1.05)
+
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number+delta",
+            value=price_f,
+            number={"suffix": " (cours)", "valueformat": ".2f"},
+            delta={
+                "reference": jv_f,
+                "relative": False,
+                "valueformat": ".2f",
+                "suffix": " vs JV",
+            },
+            title={"text": title or f"Juste valeur vs cours — {ticker_label}"},
+            gauge={
+                "axis": {"range": [lo, hi], "tickformat": ".2f"},
+                "bar": {"color": "#1565c0"},
+                "bgcolor": "white",
+                "steps": [
+                    {"range": [lo, green_lo], "color": "rgba(198, 40, 40, 0.15)"},
+                    {"range": [green_lo, green_hi], "color": "rgba(46, 125, 50, 0.2)"},
+                    {"range": [green_hi, hi], "color": "rgba(198, 40, 40, 0.15)"},
+                ],
+                "threshold": {
+                    "line": {"color": "#2e7d32", "width": 3},
+                    "thickness": 0.85,
+                    "value": jv_f,
+                },
+            },
+        )
+    )
+    apply_chart_theme(
+        fig,
+        height=CHART_HEIGHT.get("gauge", 320),
+        legend_horizontal=False,
     )
     return fig
 
@@ -2726,6 +2909,17 @@ def render_fundamentals_dashboard(prices):
                 label_txt,
                 formatted=label_txt,
                 row=row,
+            )
+        fig_jv = build_fair_value_gauge_figure(
+            row.get("Prix"),
+            row.get("Juste valeur estimée"),
+            ticker_label=detail_label,
+        )
+        if fig_jv is not None:
+            st.plotly_chart(fig_jv, use_container_width=True)
+            st.caption(
+                "Aiguille = **dernier cours** · trait vert = **juste valeur estimée** · "
+                "zone verte = bande autour de la JV."
             )
         with st.expander("Détail juste valeur", expanded=False):
             _render_fundamentals_detail_table(row, list(FAIR_VALUE_COLUMNS))

@@ -180,6 +180,8 @@ WATCHLIST_DISPLAY_COLUMNS = [
     "Synthèse globale",
     "Commentaire",
     "PER",
+    "Rendement dividende",
+    "Dividende / action",
     "Upside vs objectif",
     "RSI",
     "Bollinger %B",
@@ -431,7 +433,7 @@ def render_watchlist_dashboard(
     st.header(f"👁 Watchlist : {watchlist_name}")
     st.caption(
         "Suivi sans quantité ni PRU : cours actuel, fourchette 52 semaines, "
-        "verdicts fondamental et technique (Yahoo Finance)."
+        "dividendes (rendement TTM Yahoo), verdicts fondamental et technique."
     )
 
     rsi_period = st.slider("Période RSI", 7, 21, 14, key="wl_rsi_period")
@@ -484,7 +486,7 @@ def render_watchlist_dashboard(
 
     st.caption(
         "Montants **/ action** · pourcentages en **%** · PER en **×** · "
-        "position 52 sem. = % de la fourchette min–max."
+        "dividende = TTM Yahoo · position 52 sem. = % de la fourchette min–max."
     )
     st.dataframe(
         view_display.style.format(watchlist_format, na_rep="-")
@@ -505,7 +507,7 @@ def render_watchlist_dashboard(
     row = view_df[view_df["Ticker"] == detail].iloc[0]
     label = ticker_label(detail, ticker_names, show_company_names)
     st.markdown(f"### {label}")
-    d1, d2, d3 = st.columns(3)
+    d1, d2, d3, d4 = st.columns(4)
     d1.metric("Prix", f"{row['Prix']:.2f}" if pd.notna(row.get("Prix")) else "-")
     d2.metric(
         "Min / Max 52 sem.",
@@ -513,7 +515,12 @@ def render_watchlist_dashboard(
         if pd.notna(row.get("Min 52 sem.")) and pd.notna(row.get("Max 52 sem."))
         else "-",
     )
-    d3.metric("Synthèse", row.get("Synthèse globale", "N/A"))
+    div_yield = row.get("Rendement dividende")
+    d3.metric(
+        "Rendement dividende",
+        f"{div_yield:.2%}" if pd.notna(div_yield) else "—",
+    )
+    d4.metric("Synthèse", row.get("Synthèse globale", "N/A"))
 
     st.markdown(f"**Fondamental :** {row.get('Verdict fondamental', 'N/A')}")
     st.markdown(f"**Technique :** {row.get('Verdict technique', 'N/A')}")
