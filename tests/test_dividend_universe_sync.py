@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 import dividendes as div
@@ -108,3 +109,22 @@ def test_is_ticker_in_universe_case_insensitive():
     universe = {"tickers": {"MC.PA": {}}, "failed_tickers": {}}
     assert div._is_ticker_in_universe("mc.pa", universe)
     assert not div._is_ticker_in_universe("SAN.PA", universe)
+
+
+def test_build_dividend_universe_listing_df_filters_dividends():
+    universe = {
+        "tickers": {
+            "A.PA": {"Société": "Alpha", "A des dividendes": True},
+            "B.PA": {"Société": "Beta", "A des dividendes": False},
+        }
+    }
+    all_df = div.build_dividend_universe_listing_df(universe, only_with_dividends=False)
+    assert set(all_df["Ticker"]) == {"A.PA", "B.PA"}
+    div_df = div.build_dividend_universe_listing_df(universe, only_with_dividends=True)
+    assert list(div_df["Ticker"]) == ["A.PA"]
+
+
+def test_dividend_universe_company_names():
+    df = pd.DataFrame({"Ticker": ["A.PA", "B.PA"], "Société": ["Alpha SA", "Beta SA"]})
+    names = div.dividend_universe_company_names(df)
+    assert names["A.PA"] == "Alpha SA"

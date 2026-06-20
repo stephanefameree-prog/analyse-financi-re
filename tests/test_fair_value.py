@@ -470,7 +470,7 @@ def test_investing_anchors_yaml_loads_bnp():
     assert any(a.get("ticker") == "SOI.PA" for a in anchors)
     assert any(a.get("ticker") == "SU.PA" for a in anchors)
     frame = fv.investing_anchors_to_training_frame(anchors)
-    assert len(frame) == 15
+    assert len(frame) == 22
     bnp = frame[frame[fv.COL_NAME].astype(str).str.contains("BNP", na=False)]
     assert float(bnp["fair_value"].iloc[0]) == pytest.approx(95.18)
 

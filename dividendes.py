@@ -620,6 +620,34 @@ def _universe_rows_from_store(tickers_dict):
     return rows
 
 
+def build_dividend_universe_listing_df(universe=None, *, only_with_dividends=False):
+    """DataFrame des tickers et métadonnées depuis dividendes_universe.json."""
+    universe = universe or load_dividend_universe()
+    rows = _universe_rows_from_store(universe.get("tickers", {}))
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    if "Ticker" in df.columns:
+        df = df.drop_duplicates(subset=["Ticker"], keep="last")
+    if only_with_dividends and "A des dividendes" in df.columns:
+        df = df[df["A des dividendes"].fillna(False).astype(bool)]
+    return df.reset_index(drop=True)
+
+
+def dividend_universe_company_names(listing_df):
+    """Map ticker → nom société depuis le fichier univers dividendes."""
+    if listing_df is None or listing_df.empty or "Ticker" not in listing_df.columns:
+        return {}
+    names = {}
+    name_col = "Société" if "Société" in listing_df.columns else "Ticker"
+    for _, row in listing_df.iterrows():
+        ticker = str(row["Ticker"]).strip()
+        label = str(row.get(name_col, ticker)).strip()
+        if ticker and label and label != "—":
+            names[ticker] = label
+    return names
+
+
 def _drop_failed_ticker_variants(failed_map, store_key):
     """Retire les variantes casse/espaces d'un ticker des échecs."""
     if not store_key or not failed_map:
@@ -1738,6 +1766,28 @@ DIVIDEND_FREQUENCY_ORDER = {
 }
 
 
+def _dividend_universe_column_options(df, column):
+    """Valeurs distinctes d'une colonne métadonnées (Marché, Devise…)."""
+    if df is None or df.empty or column not in df.columns:
+        return []
+    values = (
+        df[column]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .replace("", np.nan)
+        .dropna()
+        .unique()
+        .tolist()
+    )
+    dash = "—"
+    values = [v for v in values if v != dash]
+    values.sort(key=lambda x: x.casefold())
+    if dash in df[column].astype(str).str.strip().values:
+        values.append(dash)
+    return values
+
+
 def _dividend_frequency_options(df):
     """Fréquences présentes dans l'univers, triées du plus au moins fréquent."""
     if df is None or df.empty or "Fréquence" not in df.columns:
@@ -1755,6 +1805,63 @@ def _dividend_frequency_options(df):
     return sorted(values, key=lambda x: (DIVIDEND_FREQUENCY_ORDER.get(x, 99), x))
 
 
+def _normalize_metadata_filter_values(values):
+    return {str(v).strip() for v in (values or []) if str(v).strip()}
+
+
+def filter_dividend_listing_metadata_ui(df, *, key_prefix="div_univ"):
+    """Filtres Streamlit Marché / Devise — retourne le DataFrame filtré."""
+    if df is None or df.empty:
+        return df
+    market_options = _dividend_universe_column_options(df, "Marché")
+    currency_options = _dividend_universe_column_options(df, "Devise")
+    if not market_options and not currency_options:
+        return df
+
+    st.markdown("#### Filtres marché & devise")
+    c1, c2 = st.columns(2)
+    selected_markets = market_options
+    selected_currencies = currency_options
+    with c1:
+        if market_options:
+            selected_markets = st.multiselect(
+                "Marché",
+                options=market_options,
+                default=market_options,
+                key=f"{key_prefix}_market_filter",
+                help="Place de cotation (Euronext Paris, NYSE, NASDAQ…).",
+            )
+    with c2:
+        if currency_options:
+            selected_currencies = st.multiselect(
+                "Devise",
+                options=currency_options,
+                default=currency_options,
+                key=f"{key_prefix}_currency_filter",
+                help="Devise de cotation des montants par action.",
+            )
+
+    filtered = filter_dividend_universe_by_ranges(
+        df,
+        markets=selected_markets if market_options else None,
+        currencies=selected_currencies if currency_options else None,
+    )
+    if market_options and not selected_markets:
+        st.caption("Aucun marché sélectionné — tableau et graphiques vides.")
+    elif currency_options and not selected_currencies:
+        st.caption("Aucune devise sélectionnée — tableau et graphiques vides.")
+    return filtered
+
+
+def _slider_range_active(lo, hi, bounds_lo, bounds_hi):
+    """True si le curseur Streamlit est resserré (sinon ne pas exclure les valeurs manquantes)."""
+    if lo is None or hi is None:
+        return False
+    span = max(abs(float(bounds_hi) - float(bounds_lo)), 1e-9)
+    eps = max(span * 1e-6, 1e-9)
+    return float(lo) > float(bounds_lo) + eps or float(hi) < float(bounds_hi) - eps
+
+
 def filter_dividend_universe_by_ranges(
     df,
     *,
@@ -1763,11 +1870,29 @@ def filter_dividend_universe_by_ranges(
     coverage_min=None,
     coverage_max=None,
     frequencies=None,
+    markets=None,
+    currencies=None,
 ):
-    """Filtre l'univers selon plages rendement, couverture et fréquence de versement."""
+    """Filtre l'univers selon plages rendement, couverture, fréquence, marché et devise."""
     if df is None or df.empty:
         return df
     out = df.copy()
+    if markets is not None:
+        if "Marché" not in out.columns:
+            return out.iloc[0:0]
+        allowed = _normalize_metadata_filter_values(markets)
+        if not allowed:
+            return out.iloc[0:0]
+        col = out["Marché"].astype(str).str.strip()
+        out = out[col.isin(allowed)]
+    if currencies is not None:
+        if "Devise" not in out.columns:
+            return out.iloc[0:0]
+        allowed = {v.upper() for v in _normalize_metadata_filter_values(currencies)}
+        if not allowed:
+            return out.iloc[0:0]
+        col = out["Devise"].astype(str).str.strip().str.upper()
+        out = out[col.isin(allowed)]
     if yield_min is not None or yield_max is not None:
         if "Rendement (%)" not in out.columns:
             return out.iloc[0:0]
@@ -2266,6 +2391,8 @@ def render_dividend_universe_builder(portfolio_tickers=None):
         if pf:
             full_df = full_df[full_df["Ticker"].isin(portfolio_tickers)]
 
+    full_df = filter_dividend_listing_metadata_ui(full_df, key_prefix="div_univ")
+
     dividend_base_count = len(full_df)
     chart_base = full_df.copy()
     freq_options = _dividend_frequency_options(chart_base)
@@ -2287,6 +2414,19 @@ def render_dividend_universe_builder(portfolio_tickers=None):
         )
         if not selected_freq:
             st.caption("Aucune fréquence sélectionnée — tableau et graphiques vides.")
+
+    search = st.text_input(
+        "Filtrer par société ou ticker",
+        key="div_univ_search",
+        placeholder="ex. NLY, Annaly, Amundi…",
+        help="Recherche dans l'univers affiché (après fréquence / portefeuille).",
+    )
+    if search.strip():
+        q = search.strip().casefold()
+        mask = chart_base["Ticker"].astype(str).str.contains(q, case=False, na=False)
+        if "Société" in chart_base.columns:
+            mask = mask | chart_base["Société"].astype(str).str.contains(q, case=False, na=False)
+        chart_base = chart_base[mask]
 
     yield_series = _universe_numeric_series(chart_base, "Rendement (%)")
     yield_series = yield_series[yield_series > 0]
@@ -2315,28 +2455,42 @@ def render_dividend_universe_builder(portfolio_tickers=None):
             filt1.caption("Rendement : aucune donnée disponible.")
 
         cov_max = float(cov_series.max()) if not cov_series.empty else 5.0
-        cov_max = max(cov_max, 0.5)
+        cov_max = max(cov_max, 5.0)
+        cov_max_round = round(cov_max, 2)
         if not cov_series.empty:
             with filt2:
                 cov_lo, cov_hi = st.slider(
                     "Plage ratio de couverture (×)",
                     0.0,
-                    round(cov_max, 2),
-                    (0.0, round(cov_max, 2)),
+                    cov_max_round,
+                    (0.0, cov_max_round),
                     step=0.1,
                     key="div_univ_coverage_range",
-                    help="Bénéfices ÷ dividendes. Filtre les graphiques et le tableau.",
+                    help=(
+                        "Bénéfices ÷ dividendes. Au maximum, les titres sans ratio "
+                        "(souvent REIT / mREIT comme Annaly NLY) restent dans le tableau."
+                    ),
                 )
         else:
             cov_lo = cov_hi = None
             filt2.caption("Couverture : aucune donnée disponible.")
 
+        yield_max_round = round(yield_max_pct, 2)
+        yield_active = (
+            not yield_series.empty
+            and _slider_range_active(yield_lo_pct, yield_hi_pct, 0.0, yield_max_round)
+        )
+        cov_active = (
+            not cov_series.empty
+            and _slider_range_active(cov_lo, cov_hi, 0.0, cov_max_round)
+        )
+
         filtered_df = filter_dividend_universe_by_ranges(
             chart_base,
-            yield_min=yield_lo,
-            yield_max=yield_hi,
-            coverage_min=cov_lo,
-            coverage_max=cov_hi,
+            yield_min=yield_lo if yield_active else None,
+            yield_max=yield_hi if yield_active else None,
+            coverage_min=cov_lo if cov_active else None,
+            coverage_max=cov_hi if cov_active else None,
         )
         hist_yield = _universe_numeric_series(filtered_df, "Rendement (%)")
         hist_yield = hist_yield[hist_yield > 0]
@@ -2383,20 +2537,12 @@ def render_dividend_universe_builder(portfolio_tickers=None):
             )
 
         st.caption(
-            f"**{len(filtered_df)}** titre(s) après filtres rendement / couverture / fréquence "
-            f"(sur {dividend_base_count} avec dividendes)."
+            f"**{len(filtered_df)}** titre(s) après filtres marché / devise / fréquence / "
+            f"rendement / couverture (sur {dividend_base_count} dans la sélection)."
         )
         full_df = filtered_df
     else:
         full_df = chart_base
-
-    search = st.text_input("Filtrer par société ou ticker")
-    if search.strip():
-        q = search.strip().casefold()
-        mask = full_df["Ticker"].astype(str).str.contains(q, case=False, na=False)
-        if "Société" in full_df.columns:
-            mask = mask | full_df["Société"].astype(str).str.contains(q, case=False, na=False)
-        full_df = full_df[mask]
 
     df = _dividend_table_column_order(full_df[[c for c in show_cols if c in full_df.columns]])
     df_sorted = df.sort_values("Rendement (%)", ascending=False, na_position="last")

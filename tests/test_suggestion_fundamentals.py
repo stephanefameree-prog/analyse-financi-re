@@ -1,7 +1,9 @@
 """Tests enrichissement fondamental des suggestions d'actifs."""
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from analytics import (
     build_risk_metrics_boxplot,
@@ -9,7 +11,12 @@ from analytics import (
     enrich_suggestions_with_technical,
     filter_suggestions_by_statistics,
     filter_suggestions_by_technical,
+    filter_suggestions_by_latent_returns,
+    merge_suggestion_latent_returns,
     merge_technical_columns,
+    SUGGESTION_COL_LATENT_1M,
+    SUGGESTION_COL_LATENT_1W,
+    SUGGESTION_COL_LATENT_1Y,
 )
 import fundamentals
 from fundamentals import (
@@ -202,6 +209,28 @@ def test_fundamental_ticker_disk_cache_roundtrip(tmp_path, monkeypatch):
     assert loaded["ROE"] == 0.2
 
 
+def test_fundamentals_cache_write_fallback_when_replace_blocked(tmp_path, monkeypatch):
+    cache_file = tmp_path / "fundamentals_cache.json"
+    monkeypatch.setattr(fundamentals, "_fundamentals_cache_path", lambda: cache_file)
+    real_replace = Path.replace
+
+    def blocked_replace(self, target):
+        if self.suffix == ".tmp":
+            raise PermissionError(5, "Accès refusé")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", blocked_replace)
+    row = {
+        "Ticker": "BLOCK.PA",
+        "ROE": 0.1,
+        "_fetched_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    fundamentals.save_fundamental_ticker_to_disk("BLOCK.PA", row)
+    assert cache_file.is_file()
+    loaded = fundamentals.load_fundamental_ticker_from_disk("BLOCK.PA")
+    assert loaded["ROE"] == 0.1
+
+
 def test_dividend_ticker_disk_cache_roundtrip(tmp_path, monkeypatch):
     cache_file = tmp_path / "dividendes_cache.json"
     monkeypatch.setattr(dividendes, "_dividends_cache_path", lambda: cache_file)
@@ -211,3 +240,45 @@ def test_dividend_ticker_disk_cache_roundtrip(tmp_path, monkeypatch):
     dividendes.save_dividend_ticker_to_disk("TEST.PA", row)
     loaded = dividendes.load_dividend_ticker_from_disk("TEST.PA")
     assert loaded["Rendement"] == 0.03
+
+
+def test_merge_suggestion_latent_returns():
+    n = 260
+    aaa = [100.0] * (n - 6) + [100.0, 101.0, 102.0, 103.0, 104.0, 105.0]
+    prices = pd.DataFrame({"AAA": aaa, "BBB": [200.0] * n})
+    suggestions = pd.DataFrame(
+        {
+            "Ticker": ["AAA", "BBB"],
+            "Score composite": [0.5, 0.3],
+            "Rendement candidat": [0.12, 0.05],
+        }
+    )
+    merged = merge_suggestion_latent_returns(suggestions, prices)
+    assert merged.loc[0, SUGGESTION_COL_LATENT_1W] == pytest.approx(0.05)
+    assert merged.loc[1, SUGGESTION_COL_LATENT_1W] == 0.0
+    assert pd.notna(merged.loc[0, SUGGESTION_COL_LATENT_1Y])
+    assert list(merged.columns).index(SUGGESTION_COL_LATENT_1W) == 3
+
+
+def test_filter_suggestions_by_latent_returns():
+    df = pd.DataFrame(
+        {
+            "Ticker": ["A", "B", "C", "D"],
+            SUGGESTION_COL_LATENT_1W: [0.05, -0.02, 0.01, -0.01],
+            SUGGESTION_COL_LATENT_1M: [0.10, -0.05, 0.02, 0.03],
+            SUGGESTION_COL_LATENT_1Y: [-0.20, 0.15, -0.08, -0.30],
+        }
+    )
+    rebound = filter_suggestions_by_latent_returns(
+        df,
+        min_latent_1w=0.0,
+        max_latent_1y=0.0,
+    )
+    assert list(rebound["Ticker"]) == ["A", "C"]
+
+    custom = filter_suggestions_by_latent_returns(
+        df,
+        min_latent_1m=-0.10,
+        max_latent_1m=0.05,
+    )
+    assert set(custom["Ticker"]) == {"B", "C", "D"}

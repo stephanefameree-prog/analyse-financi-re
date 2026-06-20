@@ -11,5 +11,7 @@ xlrd>=2.0.1
 requests>=2.31
 beautifulsoup4>=4.12
 statsmodels>=0.14
+arch>=6.0
+prophet>=1.1
 pytest>=7.4
 PyYAML>=6.0

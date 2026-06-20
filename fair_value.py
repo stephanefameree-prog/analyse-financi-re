@@ -1108,11 +1108,9 @@ def build_investing_anchors_index(path: str | Path | None = None) -> dict[str, d
 def merge_prediction_enrichment(
     enrich_indices: Mapping[str, Mapping[str, Mapping]] | None = None,
 ) -> dict[str, dict]:
-    """Fusion ma vue + repères YAML (ma vue prioritaire si même ticker)."""
+    """Fusion ma vue + repères YAML (repères YAML prioritaires si même ticker)."""
     merged = merge_ma_vue_indices(enrich_indices)
-    for ticker, enrich in build_investing_anchors_index().items():
-        if ticker not in merged:
-            merged[ticker] = enrich
+    merged.update(build_investing_anchors_index())
     return merged
 
 

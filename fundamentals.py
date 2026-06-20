@@ -32,7 +32,7 @@ except ImportError:
     HAS_FAIR_VALUE = False
 
 # Incrémenter si la logique de prédiction fair_value change (invalide le cache Streamlit).
-FAIR_VALUE_ENGINE_VERSION = 39
+FAIR_VALUE_ENGINE_VERSION = 42
 FAIR_VALUE_COLUMNS = (
     "Juste valeur estimée",
     "Écart juste valeur",
@@ -109,14 +109,40 @@ def _load_fundamentals_disk_store():
     return _FUNDAMENTALS_DISK_STORE
 
 
+def _write_json_cache_file(path, data):
+    """Écriture JSON ; repli si rename bloqué (OneDrive / antivirus sous Windows)."""
+    payload = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+    tmp = path.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(payload)
+        f.flush()
+    last_exc = None
+    for attempt in range(4):
+        try:
+            tmp.replace(path)
+            return
+        except OSError as exc:
+            last_exc = exc
+            time.sleep(0.2 * (attempt + 1))
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(payload)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return
+    except OSError as exc:
+        last_exc = exc
+    raise OSError(
+        f"Impossible d'écrire {path} (fichier verrouillé par OneDrive ?) : {last_exc}"
+    ) from last_exc
+
+
 def _save_fundamentals_disk_store(data):
     global _FUNDAMENTALS_DISK_STORE
     _FUNDAMENTALS_DISK_STORE = data
-    path = _fundamentals_cache_path()
-    tmp = path.with_suffix(".json.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2, default=str)
-    tmp.replace(path)
+    _write_json_cache_file(_fundamentals_cache_path(), data)
 
 
 def _invalidate_fundamentals_disk_cache():
@@ -163,6 +189,23 @@ def load_fundamental_ticker_from_disk(ticker):
     return None
 
 
+def load_per_map_from_disk(tickers):
+    """Map ticker → PER (trailing, > 0) depuis le cache fondamentaux disque."""
+    store = _load_fundamentals_disk_store().get("tickers", {})
+    per_map = {}
+    for ticker in tickers:
+        entry = store.get(ticker)
+        if not entry:
+            continue
+        row = entry.get("row") if isinstance(entry, dict) else entry
+        if not row or not _row_is_fresh(row):
+            continue
+        per = _safe_float(row.get("PER"))
+        if per is not None and per > 0:
+            per_map[ticker] = per
+    return per_map
+
+
 def save_fundamental_ticker_to_disk(ticker, row):
     """Enregistre les fondamentaux d'un ticker sur le disque."""
     if not row:
@@ -172,7 +215,11 @@ def save_fundamental_ticker_to_disk(ticker, row):
         "updated_at": datetime.now().isoformat(timespec="seconds"),
         "row": row,
     }
-    _save_fundamentals_disk_store(store)
+    try:
+        _save_fundamentals_disk_store(store)
+    except OSError:
+        # Cache mémoire / session reste valide ; évite d'interrompre Suggestions sous OneDrive.
+        pass
 
 
 def clear_fundamentals_disk_cache(ticker_signature=None):

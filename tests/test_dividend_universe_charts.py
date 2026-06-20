@@ -26,6 +26,21 @@ def test_filter_dividend_universe_by_ranges():
     assert list(out["Ticker"]) == ["D"]
 
 
+def test_filter_dividend_universe_keeps_null_coverage_when_filter_off():
+    from dividendes import _slider_range_active
+
+    df = pd.DataFrame(
+        {
+            "Ticker": ["NLY", "A"],
+            "Rendement (%)": [0.12, 0.03],
+            "Ratio couverture": [None, 1.5],
+        }
+    )
+    assert not _slider_range_active(0.0, 5.0, 0.0, 5.0)
+    out = filter_dividend_universe_by_ranges(df, coverage_min=None, coverage_max=None)
+    assert set(out["Ticker"]) == {"NLY", "A"}
+
+
 def test_filter_dividend_universe_by_frequency():
     df = pd.DataFrame(
         {
@@ -40,6 +55,28 @@ def test_filter_dividend_universe_by_frequency():
     assert list(out["Ticker"]) == ["A", "C", "D"]
 
     empty = filter_dividend_universe_by_ranges(df, frequencies=[])
+    assert empty.empty
+
+
+def test_filter_dividend_universe_by_market_and_currency():
+    df = pd.DataFrame(
+        {
+            "Ticker": ["AI.PA", "MO", "ACA.PA"],
+            "Marché": ["Euronext Paris", "NYSE", "Euronext Paris"],
+            "Devise": ["EUR", "USD", "EUR"],
+        }
+    )
+    out = filter_dividend_universe_by_ranges(
+        df,
+        markets=["Euronext Paris"],
+        currencies=["EUR"],
+    )
+    assert list(out["Ticker"]) == ["AI.PA", "ACA.PA"]
+
+    us_only = filter_dividend_universe_by_ranges(df, currencies=["usd"])
+    assert list(us_only["Ticker"]) == ["MO"]
+
+    empty = filter_dividend_universe_by_ranges(df, markets=[])
     assert empty.empty
 
 

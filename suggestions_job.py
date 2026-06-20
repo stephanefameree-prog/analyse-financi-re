@@ -8,7 +8,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from analytics import merge_technical_columns
+from analytics import merge_technical_columns, merge_suggestion_latent_returns
 from dashboard_cache import (
     cached_candidate_market_data,
     cached_candidate_technical_indicators,
@@ -85,6 +85,12 @@ def _build_candidate_pool(params: dict, index_universe: dict) -> list[str]:
 
 def _finalize_job(job: dict, wip: dict) -> None:
     params = job["params"]
+    if wip.get("suggestions") is not None and not wip["suggestions"].empty:
+        prices = wip.get("candidate_prices")
+        if prices is not None and not prices.empty:
+            wip["suggestions"] = merge_suggestion_latent_returns(
+                wip["suggestions"], prices
+            )
     st.session_state["portfolio_suggestions"] = wip["suggestions"]
     st.session_state["portfolio_suggestions_baseline"] = wip["baseline"]
     st.session_state["portfolio_suggestions_internal_corr"] = wip["baseline_internal"]

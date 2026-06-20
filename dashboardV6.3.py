@@ -3,7 +3,9 @@
 # ==========================================
 import json
 import os
+import sys
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -22,6 +24,19 @@ from analytics import (
     build_portfolio_drawdown_figure,
     build_risk_return_scatter_figure,
     build_returns_distribution_var_figure,
+    build_universe_histogram,
+    compute_cross_section_returns,
+    filter_cross_section_returns_by_ranges,
+    merge_cross_section_universe_metrics,
+    return_pct_slider_bounds,
+    numeric_slider_bounds,
+    div_yield_slider_bounds_pct,
+    CROSS_SECTION_MONTH_DAYS,
+    CROSS_SECTION_COL_PERIOD,
+    CROSS_SECTION_COL_1D,
+    CROSS_SECTION_COL_1M,
+    CROSS_SECTION_COL_DIV_YIELD,
+    CROSS_SECTION_COL_PER,
     build_suggestions_tradeoff_scatter,
     build_technical_overview_figure,
     build_technical_stochastic_figure,
@@ -32,13 +47,32 @@ from analytics import (
     interpret_fft_acf_reading,
     build_fft_cyclic_chart,
     compute_fft_model_correlations,
+    compute_fft_holdout_validation,
+    summarize_fft_holdout,
     summarize_fft_trend_quality,
+    holdout_forecast_reliable,
+    forecast_suppression_message,
+    FORECAST_HOLDOUT_CORR_MIN,
+    get_fft_interpretation_guide_md,
     interpret_fft_trend_r2,
     format_fft_rmse_display,
     FFT_TREND_OPTIONS,
     FFT_TREND_LOG_LINEAR,
     FFT_RECON_OPTIONS,
     FFT_RECON_FFT,
+    FFT_SIGNAL_OPTIONS,
+    FFT_SIGNAL_PRICE,
+    FFT_SIGNAL_RETURNS,
+    fft_signal_mode_label,
+    compute_fft_spectrogram,
+    build_fft_spectrogram_chart,
+    compute_garch_forecast,
+    compute_prophet_forecast,
+    summarize_stationary_forecast,
+    build_stationary_forecast_chart,
+    SPECTROGRAM_WINDOW_DAYS,
+    SPECTROGRAM_STEP_DAYS,
+    STATIONARY_FORECAST_HORIZON,
     FFT_PRICE_UNIT_EUR,
     FFT_PRICE_UNIT_PORTFOLIO,
     FFT_PRICE_UNIT_INDEX,
@@ -71,6 +105,11 @@ from analytics import (
     compute_support_resistance,
     compute_pivot_level,
     compute_volume_sma,
+    compute_turnover_value,
+    summarize_turnover,
+    build_turnover_value_figure,
+    interpret_turnover_comment,
+    turnover_ratio_signal,
     interpret_fibonacci_comment,
     interpret_macd_comment,
     interpret_mfi_comment,
@@ -86,9 +125,16 @@ from analytics import (
     DEFAULT_SUGGESTION_OBJECTIVE_WEIGHTS,
     filter_suggestions_by_statistics,
     filter_suggestions_by_technical,
+    filter_suggestions_by_latent_returns,
     style_suggestions_technical,
     style_technical_table,
     SUGGESTION_TECHNICAL_COLUMNS,
+    SUGGESTION_COL_LATENT_1W,
+    SUGGESTION_COL_LATENT_1M,
+    SUGGESTION_COL_LATENT_1Y,
+    SUGGESTION_LATENT_RETURN_COLUMNS,
+    SUGGESTION_WEEK_DAYS,
+    SUGGESTION_YEAR_DAYS,
 )
 
 st.set_page_config(layout="wide", page_title="Financial Dashboard V6.3")
@@ -182,6 +228,16 @@ VUES_AVEC_SECTEURS = frozenset(
         "Analyse de Fourier (FFT)",
         "Suggestions d'actifs",
     }
+)
+
+_FASTAPI_PKG = Path(__file__).resolve().parent / "analyse financière avec fast api"
+if str(_FASTAPI_PKG) not in sys.path:
+    sys.path.insert(0, str(_FASTAPI_PKG))
+
+from navigation import (
+    NAV_SUB_LABELS,
+    VUES_UNIVERS_DIVIDENDES,
+    build_nav_groups,
 )
 
 
@@ -382,6 +438,81 @@ def _suggestion_range_filter(
         return lo, hi
 
 
+def _latent_return_pct_bounds(series, *, default=(-30.0, 30.0)):
+    """Bornes slider (points %) pour une colonne de plus-value latente."""
+    s = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if s.empty:
+        return default
+    return return_pct_slider_bounds(s)
+
+
+def _sugg_hist_values(series, *, positive_only=False):
+    s = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if positive_only:
+        s = s[s > 0]
+    return s
+
+
+def _init_pct_range_session(key, pct_lo, pct_hi):
+    """Initialise ou resserre une plage curseur (% points) dans session_state."""
+    full_lo, full_hi = float(pct_lo), float(pct_hi)
+    if key not in st.session_state:
+        st.session_state[key] = (full_lo, full_hi)
+        return
+    sel_lo, sel_hi = st.session_state[key]
+    st.session_state[key] = (
+        max(full_lo, min(float(sel_lo), full_hi)),
+        min(full_hi, max(float(sel_hi), full_lo)),
+    )
+
+
+def _read_pct_range_filter(key, pct_lo, pct_hi):
+    """Lit la plage curseur (% points) → filtres décimaux ou (None, None) si plage complète."""
+    _init_pct_range_session(key, pct_lo, pct_hi)
+    sel_lo, sel_hi = st.session_state[key]
+    if sel_lo <= pct_lo and sel_hi >= pct_hi:
+        return None, None
+    return sel_lo / 100.0, sel_hi / 100.0
+
+
+def _read_numeric_range_filter(key, num_lo, num_hi):
+    """Lit une plage curseur numérique brute → (min, max) ou (None, None)."""
+    _init_pct_range_session(key, num_lo, num_hi)
+    sel_lo, sel_hi = st.session_state[key]
+    if sel_lo <= num_lo and sel_hi >= num_hi:
+        return None, None
+    return sel_lo, sel_hi
+
+
+def _suggestion_other_hist_bounds(col_name, series, *, positive_only=False):
+    """Bornes slider pour histogrammes suggestions (rendement, dividende, couverture)."""
+    s = _sugg_hist_values(series, positive_only=positive_only)
+    if col_name == "Rendement candidat":
+        if s.empty:
+            return -10.0, 10.0
+        return return_pct_slider_bounds(s)
+    if col_name == "Rendement":
+        return div_yield_slider_bounds_pct(s)
+    if col_name == "Ratio couverture":
+        if s.empty:
+            return 0.0, 5.0
+        return numeric_slider_bounds(s, floor=0.0)
+    return -10.0, 10.0
+
+
+def _render_pct_range_slider(container, label, key, pct_lo, pct_hi, *, step=0.5):
+    """Affiche un curseur double borne (% points) ; la valeur est lue via session_state[key]."""
+    _init_pct_range_session(key, pct_lo, pct_hi)
+    with container:
+        st.slider(
+            label,
+            min_value=float(pct_lo),
+            max_value=float(pct_hi),
+            step=float(step),
+            key=key,
+        )
+
+
 def _objective_weight_slider(label, low_hint, high_hint, default, key, tech_name=None):
     """Curseur 0–2 : explication simple + nom du paramètre statistique."""
     col_l, col_m, col_r = st.columns([2.5, 5, 2.5])
@@ -523,24 +654,19 @@ else:
 # ==========================================
 # Sélection de vue (avant métadonnées — secteurs chargés selon la vue)
 # ==========================================
-vue_options = [
-    "Synthèse & Plus-values",
-    "Matrice de corrélation",
-    "Analyse des risques",
-    "Optimisation (Markowitz)",
-    "Dividendes & Qualité",
-    "Analyse fondamentale",
-    "Analyse technique (RSI / MACD)",
-    "Analyse de Fourier (FFT)",
-    "Synthèse bon marché / cher",
-    "Suggestions d'actifs",
-]
-if mode_watchlist_actif:
-    vue_options = ["Ma watchlist"] + vue_options
-
+nav_groups = build_nav_groups(include_watchlist=mode_watchlist_actif)
+group_labels = list(nav_groups.keys())
+nav_group = st.sidebar.radio(
+    "Section",
+    group_labels,
+    key="nav_group",
+)
+sub_views = nav_groups[nav_group]
 vue = st.sidebar.radio(
-    "Sélectionnez une analyse :",
-    vue_options,
+    "Analyse",
+    sub_views,
+    format_func=lambda v: NAV_SUB_LABELS.get(v, v),
+    key=f"nav_vue_{nav_group}",
 )
 
 # ==========================================
@@ -651,6 +777,239 @@ if st.sidebar.button("Vider le cache des cours", help="Force un rechargement com
     st.session_state.pop("ohlcv_sig", None)
     st.sidebar.success("Cache cours vidé.")
 run_every = refresh_interval if auto_refresh_enabled and liste_tickers else None
+
+
+def _render_cross_section_returns_page(
+    prices,
+    *,
+    name_map=None,
+    universe_label="",
+    listing_df=None,
+    per_map=None,
+):
+    """Histogrammes + filtres + tableau des rendements transversaux."""
+    st.caption(
+        f"{universe_label}"
+        f"Nombre de sociétés par tranche de rendement — période **{start_date}** → aujourd'hui, "
+        f"dernière séance, et ~**{CROSS_SECTION_MONTH_DAYS} séances** (~1 mois). "
+        "Traits : **P25** (orange), **médiane** (rouge), **P75** (vert)."
+    )
+    returns_df = compute_cross_section_returns(prices)
+    returns_df = merge_cross_section_universe_metrics(returns_df, listing_df, per_map)
+    if returns_df.empty:
+        st.warning("Aucun rendement calculable pour les tickers sélectionnés.")
+        return
+
+    per_series = (
+        pd.to_numeric(returns_df[CROSS_SECTION_COL_PER], errors="coerce").dropna()
+        if CROSS_SECTION_COL_PER in returns_df.columns
+        else pd.Series(dtype=float)
+    )
+    per_series = per_series[per_series > 0]
+    div_series = (
+        pd.to_numeric(returns_df[CROSS_SECTION_COL_DIV_YIELD], errors="coerce").dropna()
+        if CROSS_SECTION_COL_DIV_YIELD in returns_df.columns
+        else pd.Series(dtype=float)
+    )
+    div_series_pos = div_series[div_series > 0]
+    if not per_series.empty:
+        st.caption(
+            f"PER (cache fondamentaux) disponible pour **{len(per_series)}** / **{len(returns_df)}** titres."
+        )
+    elif HAS_FUNDAMENTALS:
+        st.caption(
+            "PER indisponible — lancez une analyse fondamentale ou des suggestions "
+            "pour remplir le cache `fundamentals`."
+        )
+
+    p_lo, p_hi = return_pct_slider_bounds(returns_df[CROSS_SECTION_COL_PERIOD])
+    d_lo, d_hi = return_pct_slider_bounds(returns_df[CROSS_SECTION_COL_1D])
+    month_series = returns_df[CROSS_SECTION_COL_1M].dropna()
+    if not month_series.empty:
+        m_lo, m_hi = return_pct_slider_bounds(month_series)
+    else:
+        m_lo, m_hi = -10.0, 10.0
+
+    st.markdown("#### Filtres par plage de rendement")
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        period_lo_pct, period_hi_pct = st.slider(
+            "Plage rendement période (%)",
+            p_lo,
+            p_hi,
+            (p_lo, p_hi),
+            step=0.1,
+            key="cross_ret_period_range",
+            help="Filtre les graphiques et le tableau ci-dessous.",
+        )
+    with f2:
+        day_lo_pct, day_hi_pct = st.slider(
+            "Plage rendement 1 jour (%)",
+            d_lo,
+            d_hi,
+            (d_lo, d_hi),
+            step=0.1,
+            key="cross_ret_1d_range",
+        )
+    with f3:
+        if not month_series.empty:
+            month_lo_pct, month_hi_pct = st.slider(
+                f"Plage rendement ~{CROSS_SECTION_MONTH_DAYS} séances (%)",
+                m_lo,
+                m_hi,
+                (m_lo, m_hi),
+                step=0.1,
+                key="cross_ret_1m_range",
+            )
+        else:
+            month_lo_pct, month_hi_pct = m_lo, m_hi
+            st.caption(
+                f"Rendement ~1 mois : historique insuffisant "
+                f"(< {CROSS_SECTION_MONTH_DAYS + 1} séances)."
+            )
+
+    div_lo_pct = div_hi_pct = None
+    per_lo = per_hi = None
+    st.markdown("#### Filtres dividende & valorisation")
+    fd1, fd2 = st.columns(2)
+    with fd1:
+        if not div_series_pos.empty:
+            y_lo, y_hi = div_yield_slider_bounds_pct(div_series_pos)
+            div_lo_pct, div_hi_pct = st.slider(
+                "Plage rendement dividende (%)",
+                y_lo,
+                y_hi,
+                (y_lo, y_hi),
+                step=0.1,
+                key="cross_ret_div_yield_range",
+                help="Rendement dividende TTM (univers dividendes).",
+            )
+        else:
+            st.caption("Rendement dividende : aucune donnée positive dans l'univers.")
+    with fd2:
+        if not per_series.empty:
+            pmin, pmax = numeric_slider_bounds(per_series, floor=0.5, ceiling=200.0)
+            per_lo, per_hi = st.slider(
+                "Plage PER (×)",
+                pmin,
+                pmax,
+                (pmin, pmax),
+                step=0.5,
+                key="cross_ret_per_range",
+                help="PER trailing > 0 (cache fondamentaux, titres profitables).",
+            )
+        else:
+            st.caption("PER : cache fondamentaux vide pour cet univers.")
+
+    filtered_df = filter_cross_section_returns_by_ranges(
+        returns_df,
+        period_min=period_lo_pct / 100.0,
+        period_max=period_hi_pct / 100.0,
+        day_min=day_lo_pct / 100.0,
+        day_max=day_hi_pct / 100.0,
+        month_min=month_lo_pct / 100.0 if not month_series.empty else None,
+        month_max=month_hi_pct / 100.0 if not month_series.empty else None,
+        div_yield_min=div_lo_pct / 100.0 if div_lo_pct is not None else None,
+        div_yield_max=div_hi_pct / 100.0 if div_hi_pct is not None else None,
+        per_min=per_lo if per_lo is not None else None,
+        per_max=per_hi if per_hi is not None else None,
+    )
+    filtered_df = add_company_names(
+        filtered_df,
+        name_map or {},
+        show_names=show_company_names,
+    )
+    filtered_df = filtered_df.sort_values(
+        CROSS_SECTION_COL_PERIOD, ascending=False, na_position="last"
+    )
+
+    h_period, h_1d, h_1m = st.columns(3)
+    hist_period = pd.to_numeric(filtered_df[CROSS_SECTION_COL_PERIOD], errors="coerce").dropna()
+    hist_1d = pd.to_numeric(filtered_df[CROSS_SECTION_COL_1D], errors="coerce").dropna()
+    hist_1m = pd.to_numeric(filtered_df[CROSS_SECTION_COL_1M], errors="coerce").dropna()
+
+    fig_period = build_universe_histogram(
+        hist_period,
+        title="Répartition des rendements (période)",
+        xaxis_title="Rendement période (%)",
+        tickformat=".1%",
+    )
+    if fig_period is not None:
+        h_period.plotly_chart(fig_period, use_container_width=True)
+    else:
+        h_period.info("Aucune action dans la plage sélectionnée.")
+
+    fig_1d = build_universe_histogram(
+        hist_1d,
+        title="Répartition — rendement 1 jour",
+        xaxis_title="Rendement 1 jour (%)",
+        tickformat=".1%",
+    )
+    if fig_1d is not None:
+        h_1d.plotly_chart(fig_1d, use_container_width=True)
+    else:
+        h_1d.info("Aucune action dans la plage sélectionnée.")
+
+    fig_1m = build_universe_histogram(
+        hist_1m,
+        title="Répartition — rendement 1 mois",
+        xaxis_title=f"Rendement ~{CROSS_SECTION_MONTH_DAYS} séances (%)",
+        tickformat=".1%",
+    )
+    if fig_1m is not None:
+        h_1m.plotly_chart(fig_1m, use_container_width=True)
+    else:
+        h_1m.info("Aucune action dans la plage sélectionnée (ou données 1 mois absentes).")
+
+    st.markdown("#### Actions filtrées")
+    st.caption(
+        f"**{len(filtered_df)}** action(s) sur **{len(returns_df)}** "
+        "respectent l'ensemble des plages sélectionnées."
+    )
+    display_cols = ["Ticker"]
+    if show_company_names and "Nom" in filtered_df.columns:
+        display_cols.append("Nom")
+    display_cols.extend(
+        [
+            CROSS_SECTION_COL_PERIOD,
+            CROSS_SECTION_COL_1D,
+            CROSS_SECTION_COL_1M,
+            CROSS_SECTION_COL_DIV_YIELD,
+            CROSS_SECTION_COL_PER,
+        ]
+    )
+    display_cols = [c for c in display_cols if c in filtered_df.columns]
+    table_df = filtered_df[display_cols].copy()
+    if filtered_df.empty:
+        st.info("Aucune action ne correspond aux plages sélectionnées.")
+    else:
+        fmt = {
+            CROSS_SECTION_COL_PERIOD: "{:.2%}",
+            CROSS_SECTION_COL_1D: "{:.2%}",
+            CROSS_SECTION_COL_1M: "{:.2%}",
+        }
+        if CROSS_SECTION_COL_DIV_YIELD in table_df.columns:
+            fmt[CROSS_SECTION_COL_DIV_YIELD] = "{:.2%}"
+        if CROSS_SECTION_COL_PER in table_df.columns:
+            fmt[CROSS_SECTION_COL_PER] = "{:.1f}"
+        grad_cols = [
+            c
+            for c in (
+                CROSS_SECTION_COL_PERIOD,
+                CROSS_SECTION_COL_1D,
+                CROSS_SECTION_COL_1M,
+                CROSS_SECTION_COL_DIV_YIELD,
+            )
+            if c in table_df.columns
+        ]
+        st.dataframe(
+            table_df.style.format(fmt, na_rep="—").background_gradient(
+                cmap="RdYlGn",
+                subset=grad_cols,
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
 
 
 @st.fragment
@@ -1190,6 +1549,79 @@ def render_live_dashboard():
         else:
             st.error("Module watchlists indisponible.")
 
+    elif vue == "Distribution des rendements":
+        st.header("📊 Distribution des rendements")
+        if not HAS_DIVIDENDES:
+            st.error("Module dividendes indisponible — impossible de charger l'univers dividendes.")
+        else:
+            universe = dividendes.load_dividend_universe()
+            meta = universe.get("meta", {})
+            only_div = st.checkbox(
+                "Titres avec dividendes seulement",
+                value=True,
+                key="cross_ret_div_universe_only_div",
+                help="Aligné sur le filtre par défaut de l'univers dividendes.",
+            )
+            listing_df = dividendes.build_dividend_universe_listing_df(
+                universe, only_with_dividends=only_div
+            )
+            base_count = len(listing_df)
+            if not listing_df.empty:
+                listing_df = dividendes.filter_dividend_listing_metadata_ui(
+                    listing_df, key_prefix="cross_ret"
+                )
+            if base_count == 0:
+                st.info(
+                    "L'univers dividendes n'est pas encore construit ou ne contient aucun titre "
+                    "correspondant au filtre. Construisez-le via **Dividendes & Qualité** "
+                    "→ *Univers dividendes* ou `python build_dividend_universe.py`."
+                )
+            elif listing_df.empty:
+                st.info(
+                    "Aucun titre ne correspond aux **marchés** ou **devises** sélectionnés. "
+                    "Élargissez la sélection ci-dessus."
+                )
+            else:
+                div_tickers = listing_df["Ticker"].astype(str).tolist()
+                universe_label = (
+                    f"Univers **`dividendes_universe.json`** — **{len(div_tickers)}** titre(s)"
+                )
+                if meta.get("updated_at"):
+                    universe_label += f" · MAJ {meta['updated_at']}"
+                universe_label += ". "
+                name_map = dividendes.dividend_universe_company_names(listing_df)
+                with st.spinner("Chargement des cours de l'univers dividendes…"):
+                    div_prices, *_rest = load_ohlcv_in_batches(
+                        div_tickers, start=start_date, refresh="auto"
+                    )
+                    if div_prices.empty:
+                        div_prices, *_rest = load_ohlcv_in_batches(
+                            div_tickers, start=start_date, refresh="full"
+                        )
+                available = [t for t in div_tickers if t in div_prices.columns]
+                missing = len(div_tickers) - len(available)
+                if missing:
+                    st.caption(
+                        f"Cours disponibles pour **{len(available)}** / **{len(div_tickers)}** titres "
+                        f"({missing} sans données Yahoo sur la période)."
+                    )
+                if not available:
+                    st.warning(
+                        "Aucun cours disponible pour l'univers dividendes sur la période sélectionnée."
+                    )
+                else:
+                    per_map = fundamentals.load_per_map_from_disk(available) if HAS_FUNDAMENTALS else None
+                    listing_avail = listing_df[
+                        listing_df["Ticker"].astype(str).isin(available)
+                    ]
+                    _render_cross_section_returns_page(
+                        div_prices[available],
+                        name_map=name_map,
+                        universe_label=universe_label,
+                        listing_df=listing_avail,
+                        per_map=per_map,
+                    )
+
     elif not prices.empty and not returns.empty:
         tickers_tuple = tuple(sorted(liste_tickers))
         start_date_str = str(start_date)
@@ -1374,7 +1806,7 @@ def render_live_dashboard():
 
             _return_distribution_view()
 
-            st.markdown("### Boîtes à moustaches — rendements journaliers")
+            st.markdown("### Rendements journaliers")
             st.caption(
                 "Pour chaque actif, un **trait horizontal** va du rendement journalier **minimum** "
                 "au **maximum** ; les repères indiquent **Q1**, la **médiane** (losange) et **Q3**."
@@ -1390,7 +1822,7 @@ def render_live_dashboard():
                 use_container_width=True,
             )
 
-            st.markdown("### Boîtes à moustaches — métriques agrégées")
+            st.markdown("### Métriques agrégées")
             st.caption(
                 "Compare la **dispersion entre actifs** pour une même mesure : trait **min–max**, "
                 "repères **Q1 / médiane / Q3**, et **points violets** (un par titre). "
@@ -1749,6 +2181,7 @@ def render_live_dashboard():
                 )
                 st.caption(
                     "Prix et moyennes en **/ action** · volumes en **titres** · "
+                    "**valeur échangée** = volume × cours (devise de cotation : €, $…) · "
                     "RSI/MFI/stochastique sur **0–100** · ATR/Prix en **%**. "
                     "**Vert** = survente · **rouge** = surachat (colonnes signal et indicateurs)."
                 )
@@ -2038,10 +2471,44 @@ def render_live_dashboard():
                         st.info(interpret_fibonacci_comment(s, fib_data))
 
                 if has_volume:
-                    st.subheader("📊 Volumes & indicateurs associés")
+                    st.subheader("📊 Volumes & liquidité")
                     vol_aligned = volumes[detail_ticker].reindex(s.index)
-                    vol_sma20 = compute_volume_sma(vol_aligned, 20)
+                    quote_currency = "$" if is_usd_ticker(detail_ticker) else "€"
+                    turnover_summary = summarize_turnover(vol_aligned, s, period=20)
+
+                    if turnover_summary:
+                        tc1, tc2, tc3 = st.columns(3)
+                        tc1.metric(
+                            f"Valeur échangée (dernière séance, {quote_currency})",
+                            f"{turnover_summary['last']:,.0f}",
+                        )
+                        ratio_txt = (
+                            f"{turnover_summary['ratio']:.2f}×"
+                            if turnover_summary["ratio"] is not None
+                            else "—"
+                        )
+                        tc2.metric("Valeur / moy. 20 j", ratio_txt)
+                        tc3.metric(
+                            "Signal liquidité",
+                            turnover_ratio_signal(turnover_summary["ratio"]),
+                        )
+
                     st.info(interpret_volume_comment(vol_aligned, s, period=20))
+                    fig_turnover = build_turnover_value_figure(
+                        vol_aligned,
+                        s,
+                        detail_label=detail_label,
+                        period=20,
+                        currency=quote_currency,
+                        ohlc=ohlc if has_ohlc else None,
+                    )
+                    if fig_turnover is not None:
+                        st.plotly_chart(fig_turnover, use_container_width=True)
+                        st.info(
+                            interpret_turnover_comment(
+                                vol_aligned, s, period=20, currency=quote_currency
+                            )
+                        )
 
                     obv = compute_obv(s, vol_aligned)
                     mfi_series = pd.Series(dtype=float)
@@ -2119,7 +2586,12 @@ def render_live_dashboard():
 | **Corr. vs MM41 / lissage** | Modes MM41 ou STL : qualité du modèle sur la **série lissée** (sans bruit journalier). |
 | **Corr. modèle (sans dé-trend)** | (Modes classiques) FFT sur log(prix) sans retirer la tendance — comparaison. |
 | **Modèle FFT** | Tendance + cycles combinés, reprojetés en **prix** (cyan) ; prolongation **+30 %** en pointillé après la ligne « Fin historique ». |
+| **Modèle holdout (N j)** | **Orange clair (plein)** = calibrage depuis le **début de l'historique** jusqu'à T−N. **Orange foncé (pointillé)** = projection sur les N derniers jours. Option « fenêtre décalée » pour ignorer les N premiers jours. |
 | **Prix** | Courbe **bleue** : historique réel du titre. |
+| **Signal analysé** | **Prix** (log + dé-trend) ou **rendements log centrés** (série quasi-stationnaire). |
+| **Spectrogramme** | FFT **glissante** : heatmap période × date — voit si un cycle est stable ou local dans le temps. |
+| **GARCH / Prophet** | Prévisions sur rendements (GARCH) ou prix (Prophet) ; **masquées** si l'un des deux échoue le holdout (corr < **0,30**). |
+| **Extrapolation +30 %** | Prolongation du modèle FFT après « Fin historique » ; **masquée** si corr holdout FFT < **0,30**. |
 
 **Tendances disponibles :** **Log-linéaire** · **Linéaire €** · **Hodrick-Prescott**
 · **MM centrée 41 j** (analyse, ±20 séances — regard futur) · **MM causale 41 j** (sans look-ahead, extrapolation)
@@ -2127,7 +2599,7 @@ def render_live_dashboard():
 
 **Reconstruction du modèle :** **FFT (pics)** · **Harmonique (périodes FFT)** · **Harmonique (21–126 j fixes)**.
 
-**Extrapolation :** le modèle mathématique (tendance + harmoniques) est prolongé de **30 %** de la durée
+**Extrapolation (si holdout OK) :** le modèle mathématique (tendance + harmoniques) est prolongé de **30 %** de la durée
 observée (jours de bourse). Zone pointillée = **scénario exploratoire**, pas une prévision garantie.
 
 **Précautions :** un pic FFT peut venir du hasard, d'un dividende récurrent mal lissé ou d'une
@@ -2135,8 +2607,16 @@ fenêtre trop courte. Croisez avec l'analyse technique et fondamentale.
 
 **Amplitude en fin de série :** cochez **Priorité aux valeurs récentes** pour éviter l'atténuation
 due à la fenêtre Hanning (reconstruction harmonique pondérée + tendance locale).
+
+→ Voir l'expander **« Comment interpréter les indicateurs ? »** pour les seuils détaillés (corr, RMSE, R²…).
                     """
                 )
+
+            with st.expander(
+                "📊 Comment interpréter les indicateurs ?",
+                expanded=False,
+            ):
+                st.markdown(get_fft_interpretation_guide_md(FORECAST_HOLDOUT_CORR_MIN))
 
             if prices.empty or len(prices.dropna(how="all")) < 40:
                 st.warning(
@@ -2162,6 +2642,16 @@ due à la fenêtre Hanning (reconstruction harmonique pondérée + tendance loca
                         step=5,
                     )
                     top_peaks = c_fft3.slider("Nombre de pics affichés", 3, 10, 5)
+                    signal_mode = st.selectbox(
+                        "Signal analysé",
+                        options=list(FFT_SIGNAL_OPTIONS.keys()),
+                        format_func=fft_signal_mode_label,
+                        key="fft_signal_mode",
+                        help=(
+                            "**Prix** : log + dé-trend (classique). "
+                            "**Rendements log** : série centrée, mieux adaptée au non-stationnaire."
+                        ),
+                    )
                     recency_fit = st.checkbox(
                         "Priorité aux valeurs récentes (amplitude)",
                         value=True,
@@ -2169,6 +2659,27 @@ due à la fenêtre Hanning (reconstruction harmonique pondérée + tendance loca
                         help=(
                             "Reconstruction sans fenêtre Hanning + pondération récente "
                             "et tendance locale en fin de série — réduit l'écart en bout d'historique."
+                        ),
+                    )
+                    holdout_days = st.slider(
+                        "Validation holdout (jours)",
+                        min_value=20,
+                        max_value=150,
+                        value=100,
+                        step=5,
+                        key="fft_holdout_days",
+                        help=(
+                            "Recalcule le même modèle sur l'historique **jusqu'à J−N**, "
+                            "puis projette sur les **N dernières séances** pour comparer au cours."
+                        ),
+                    )
+                    holdout_shifted = st.checkbox(
+                        "Fenêtre holdout décalée (+N j au début)",
+                        value=False,
+                        key="fft_holdout_shifted",
+                        help=(
+                            "Par défaut, le calibrage part de la **date de début** (barre latérale). "
+                            "Coché : fenêtre interne sans les N premiers et N derniers jours."
                         ),
                     )
 
@@ -2228,6 +2739,7 @@ due à la fenêtre Hanning (reconstruction harmonique pondérée + tendance loca
                             max_period,
                             top_peaks,
                             trend_mode,
+                            signal_mode,
                         )
                         if port_fft is None:
                             st.warning("FFT portefeuille indisponible sur la période.")
@@ -2284,12 +2796,37 @@ due à la fenêtre Hanning (reconstruction harmonique pondérée + tendance loca
                                 )
                             with _trend_metrics:
                                 _fft_trend_quality_caption(port_fft, price_unit=port_price_unit)
+                            port_holdout = compute_fft_holdout_validation(
+                                portfolio_series,
+                                holdout_days=holdout_days,
+                                min_period_days=min_period,
+                                max_period_days=max_period,
+                                top_n=top_peaks,
+                                trend_mode=trend_mode,
+                                signal_mode=signal_mode,
+                                recon_mode=recon_mode,
+                                n_components=min(top_peaks, len(port_fft["peaks"])),
+                                shifted_window=holdout_shifted,
+                                recency_weighted=recency_fit,
+                                recency_calibrate=recency_fit,
+                            )
+                            holdout_caption = summarize_fft_holdout(
+                                port_holdout, price_unit=port_price_unit
+                            )
+                            if holdout_caption:
+                                st.info(holdout_caption)
+                            _fft_suppress = forecast_suppression_message(
+                                port_holdout, context="extrapolation FFT"
+                            )
+                            if _fft_suppress:
+                                st.warning(_fft_suppress)
                             st.plotly_chart(
                                 build_fft_cyclic_chart(
                                     port_fft,
                                     n_components=min(top_peaks, len(port_fft["peaks"])),
                                     title="Cycle estimé vs portefeuille complet",
                                     recon_mode=recon_mode,
+                                    holdout_validation=port_holdout,
                                     recency_weighted=recency_fit,
                                     recency_calibrate=recency_fit,
                                 ),
@@ -2312,6 +2849,7 @@ due à la fenêtre Hanning (reconstruction harmonique pondérée + tendance loca
                         max_period,
                         3,
                         trend_mode,
+                        signal_mode,
                         tickers_tuple,
                         start_date_str,
                     )
@@ -2352,6 +2890,7 @@ due à la fenêtre Hanning (reconstruction harmonique pondérée + tendance loca
                             max_period,
                             top_peaks,
                             trend_mode,
+                            signal_mode,
                         )
                         if fft_result is None:
                             st.warning("FFT indisponible pour ce titre.")
@@ -2389,12 +2928,37 @@ due à la fenêtre Hanning (reconstruction harmonique pondérée + tendance loca
                                 hide_index=True,
                             )
                             _fft_trend_quality_caption(fft_result)
+                            detail_holdout = compute_fft_holdout_validation(
+                                prices[fft_ticker],
+                                holdout_days=holdout_days,
+                                min_period_days=min_period,
+                                max_period_days=max_period,
+                                top_n=top_peaks,
+                                trend_mode=trend_mode,
+                                signal_mode=signal_mode,
+                                recon_mode=recon_mode,
+                                n_components=min(top_peaks, len(fft_result["peaks"])),
+                                shifted_window=holdout_shifted,
+                                recency_weighted=recency_fit,
+                                recency_calibrate=recency_fit,
+                            )
+                            detail_holdout_caption = summarize_fft_holdout(
+                                detail_holdout, price_unit=FFT_PRICE_UNIT_EUR
+                            )
+                            if detail_holdout_caption:
+                                st.info(detail_holdout_caption)
+                            _detail_suppress = forecast_suppression_message(
+                                detail_holdout, context="extrapolation FFT"
+                            )
+                            if _detail_suppress:
+                                st.warning(_detail_suppress)
                             st.plotly_chart(
                                 build_fft_cyclic_chart(
                                     fft_result,
                                     n_components=min(top_peaks, len(fft_result["peaks"])),
                                     title=f"Cycle estimé vs prix — {detail_label}",
                                     recon_mode=recon_mode,
+                                    holdout_validation=detail_holdout,
                                     recency_weighted=recency_fit,
                                     recency_calibrate=recency_fit,
                                 ),
@@ -2408,6 +2972,95 @@ due à la fenêtre Hanning (reconstruction harmonique pondérée + tendance loca
                                     f"(~{w1:.0%} de la puissance dans la bande analysée). "
                                     "À interpréter comme une **tendance cyclique possible**, pas une règle stricte."
                                 )
+
+                            with st.expander(
+                                "📊 Spectrogramme (FFT glissante — cycles dans le temps)",
+                                expanded=False,
+                            ):
+                                st.caption(
+                                    "Heatmap : comment la **puissance spectrale** se déplace "
+                                    "dans le temps (fenêtre glissante). Ligne orange = période dominante locale. "
+                                    "→ Seuils et lecture détaillée : expander **« Comment interpréter les indicateurs ? »**."
+                                )
+                                spec_window = st.slider(
+                                    "Fenêtre spectrogramme (jours)",
+                                    60,
+                                    min(252, len(prices[fft_ticker].dropna()) // 2),
+                                    SPECTROGRAM_WINDOW_DAYS,
+                                    step=10,
+                                    key="fft_spec_window",
+                                )
+                                spec = compute_fft_spectrogram(
+                                    prices[fft_ticker],
+                                    window_days=spec_window,
+                                    step_days=SPECTROGRAM_STEP_DAYS,
+                                    min_period_days=min_period,
+                                    max_period_days=max_period,
+                                    signal_mode=signal_mode,
+                                    trend_mode=trend_mode,
+                                )
+                                spec_fig = build_fft_spectrogram_chart(
+                                    spec,
+                                    title=f"Spectrogramme — {detail_label}",
+                                )
+                                if spec_fig is None:
+                                    st.warning("Spectrogramme indisponible (historique trop court).")
+                                else:
+                                    st.plotly_chart(spec_fig, use_container_width=True)
+
+                            with st.expander(
+                                "📈 Prévisions stationnaires (GARCH & Prophet)",
+                                expanded=False,
+                            ):
+                                st.caption(
+                                    "Modèles adaptés au **non-stationnaire** : GARCH sur rendements, "
+                                    "Prophet sur prix (tendance + saisonnalités). Validation holdout intégrée. "
+                                    f"Prévisions masquées si corr holdout < **{FORECAST_HOLDOUT_CORR_MIN}** "
+                                    "pour l'un des modèles — voir le guide d'interprétation."
+                                )
+                                fc_horizon = st.slider(
+                                    "Horizon de prévision (jours)",
+                                    10,
+                                    90,
+                                    STATIONARY_FORECAST_HORIZON,
+                                    step=5,
+                                    key="fft_fc_horizon",
+                                )
+                                fc_holdout = st.slider(
+                                    "Holdout prévision (jours)",
+                                    20,
+                                    120,
+                                    60,
+                                    step=5,
+                                    key="fft_fc_holdout",
+                                )
+                                garch_res = compute_garch_forecast(
+                                    prices[fft_ticker],
+                                    horizon_days=fc_horizon,
+                                    holdout_days=fc_holdout,
+                                )
+                                prophet_res = compute_prophet_forecast(
+                                    prices[fft_ticker],
+                                    horizon_days=fc_horizon,
+                                    holdout_days=fc_holdout,
+                                )
+                                fc_summary = summarize_stationary_forecast(
+                                    garch_res, prophet_res
+                                )
+                                if fc_summary:
+                                    st.info(fc_summary)
+                                fc_fig = build_stationary_forecast_chart(
+                                    garch_res,
+                                    prophet_res,
+                                    title=f"Prévisions — {detail_label}",
+                                )
+                                if fc_fig is None:
+                                    st.warning(
+                                        "Prévisions indisponibles — installez `arch` et `prophet` "
+                                        "(voir requirements.txt)."
+                                    )
+                                else:
+                                    st.plotly_chart(fc_fig, use_container_width=True)
 
                 _fft_interactive()
         elif vue == "Synthèse bon marché / cher":
@@ -3066,13 +3719,19 @@ due à la fenêtre Hanning (reconstruction harmonique pondérée + tendance loca
                             if len(suggestions_view) < before_dividends:
                                 filter_parts.append("dividendes")
 
+                        suggestions_pre_latent = suggestions_view
+                        has_latent_cols = any(
+                            c in suggestions_pre_latent.columns
+                            for c in SUGGESTION_LATENT_RETURN_COLUMNS
+                        )
+
                         if filter_parts:
                             st.caption(
                                 f"Filtre {' + '.join(filter_parts)} : "
-                                f"**{len(suggestions_view)}** / {len(suggestions)} "
+                                f"**{len(suggestions_pre_latent)}** / {len(suggestions)} "
                                 "candidats conservés."
                             )
-                        if suggestions_view.empty:
+                        if suggestions_pre_latent.empty:
                             st.warning(
                                 "Aucun candidat ne passe les filtres actifs. "
                                 "Assouplissez les seuils ou regénérez les suggestions."
@@ -3131,103 +3790,502 @@ due à la fenêtre Hanning (reconstruction harmonique pondérée + tendance loca
                                 "ℹ️ Le mode de sélection a changé — regénérez si besoin."
                             )
 
-                        if suggestions_view.empty:
-                            pass
-                        else:
-                            display_df = suggestions_view.head(top_n).copy()
-                            if "Ticker" in display_df.columns and (
-                                show_company_names or need_ticker_sectors
-                            ):
-                                sugg_names, sugg_sectors = _resolve_ticker_metadata(
-                                    display_df["Ticker"].tolist(),
-                                    ticker_names,
-                                    ticker_sectors,
-                                    need_names=show_company_names,
-                                    need_sectors=need_ticker_sectors,
-                                )
-                                display_df = add_company_names(
-                                    display_df,
-                                    sugg_names,
-                                    show_names=show_company_names,
-                                    sectors=sugg_sectors if need_ticker_sectors else None,
-                                )
-                            elif "Ticker" in display_df.columns:
-                                display_df = add_company_names(
-                                    display_df,
-                                    {},
-                                    show_names=False,
-                                    sectors=None,
-                                )
-                            display_view = rename_columns_for_display(
-                                display_df, SUGGESTIONS_LABELS
-                            )
-                            sugg_format = format_map_for_labeled_columns(
-                                display_view, SUGGESTIONS_LABELS, SUGGESTIONS_FORMAT
-                            )
-                            st.caption(
-                                "Rendements et volatilités en **%** · corrélations sur **0–1** · "
-                                "Δ = impact simulé sur le portefeuille."
-                            )
-                            if HAS_FUNDAMENTALS and any(
-                                c in display_df.columns
-                                for c in fundamentals.SUGGESTION_QUALITY_COLUMNS
-                            ):
-                                st.caption(
-                                    "Indicateurs fondamentaux : **vert** = repère favorable · "
-                                    "**rouge** = repère défavorable (voir page *Dividendes & Qualité*)."
-                                )
-                            if any(
-                                c in display_df.columns
-                                for c in SUGGESTION_TECHNICAL_COLUMNS
-                            ):
-                                st.caption(
-                                    "Indicateurs techniques : **vert** = survente / bas de bande · "
-                                    "**rouge** = surachat / haut de bande."
-                                )
-                            if HAS_DIVIDENDES and any(
-                                c in display_df.columns
-                                for c in dividendes.SUGGESTION_DIVIDEND_COLUMNS
-                            ):
-                                st.caption(
-                                    "Indicateurs dividendes : **vert** = rendement / croissance / "
-                                    "couverture favorables · **rouge** = signaux faibles."
-                                )
-                            styled_sugg = display_view.style.format(sugg_format, na_rep="-")
-                            grad_pos = pick_existing_columns(
-                                display_view,
-                                "Score composite (pts)",
-                                "Δ Rendement portef. (%)",
-                            )
-                            if grad_pos:
-                                styled_sugg = styled_sugg.background_gradient(
-                                    cmap="RdYlGn", subset=grad_pos
-                                )
-                            grad_neg = pick_existing_columns(
-                                display_view,
-                                "Δ Volatilité portef. (%)",
-                                "Δ Kurtosis portef.",
-                                "Δ Corr. interne (0–1)",
-                            )
-                            if grad_neg:
-                                styled_sugg = styled_sugg.background_gradient(
-                                    cmap="RdYlGn", subset=grad_neg
-                                )
-                            if HAS_FUNDAMENTALS:
-                                styled_sugg = fundamentals.style_fundamentals_sentiment(
-                                    styled_sugg
-                                )
-                            if any(
-                                c in display_df.columns
-                                for c in SUGGESTION_TECHNICAL_COLUMNS
-                            ):
-                                styled_sugg = style_suggestions_technical(styled_sugg)
-                            if HAS_DIVIDENDES and any(
-                                c in display_df.columns
-                                for c in dividendes.SUGGESTION_DIVIDEND_COLUMNS
-                            ):
-                                styled_sugg = dividendes.style_dividend_sentiment(styled_sugg)
-                            st.dataframe(styled_sugg)
+                        suggestions_table_slot = st.empty()
 
+                        lat_1w_lo = lat_1w_hi = None
+                        lat_1m_lo = lat_1m_hi = None
+                        lat_1y_lo = lat_1y_hi = None
+                        if has_latent_cols and not suggestions_pre_latent.empty:
+                            latent_hist_specs = [
+                                (
+                                    SUGGESTION_COL_LATENT_1W,
+                                    "Plus-value latente — 1 semaine",
+                                    f"Rendement ~{SUGGESTION_WEEK_DAYS} séances (%)",
+                                    ".1%",
+                                    False,
+                                    "1 semaine",
+                                    "sugg_lat_1w",
+                                    (-30.0, 30.0),
+                                ),
+                                (
+                                    SUGGESTION_COL_LATENT_1M,
+                                    "Plus-value latente — 1 mois",
+                                    f"Rendement ~{CROSS_SECTION_MONTH_DAYS} séances (%)",
+                                    ".1%",
+                                    False,
+                                    "1 mois",
+                                    "sugg_lat_1m",
+                                    (-30.0, 30.0),
+                                ),
+                                (
+                                    SUGGESTION_COL_LATENT_1Y,
+                                    "Plus-value latente — 1 an",
+                                    f"Rendement ~{SUGGESTION_YEAR_DAYS} séances (%)",
+                                    ".1%",
+                                    False,
+                                    "1 an",
+                                    "sugg_lat_1y",
+                                    (-50.0, 50.0),
+                                ),
+                            ]
+                            latent_hist_specs = [
+                                spec
+                                for spec in latent_hist_specs
+                                if spec[0] in suggestions_pre_latent.columns
+                            ]
+                            latent_base_key = "sugg_hist_base_count"
+                            if st.session_state.get(latent_base_key) != len(
+                                suggestions_pre_latent
+                            ):
+                                for reset_key in (
+                                    "sugg_lat_1w_range",
+                                    "sugg_lat_1m_range",
+                                    "sugg_lat_1y_range",
+                                    "sugg_hist_cand_range",
+                                    "sugg_hist_yield_range",
+                                    "sugg_hist_cov_range",
+                                ):
+                                    st.session_state.pop(reset_key, None)
+                                st.session_state[latent_base_key] = len(
+                                    suggestions_pre_latent
+                                )
+                            for (
+                                col_name,
+                                _title,
+                                _x_title,
+                                _tick_fmt,
+                                _pos_only,
+                                _slider_label,
+                                slider_key,
+                                slider_default,
+                            ) in latent_hist_specs:
+                                pct_lo, pct_hi = _latent_return_pct_bounds(
+                                    suggestions_pre_latent[col_name],
+                                    default=slider_default,
+                                )
+                                slider_state_key = f"{slider_key}_range"
+                                lo, hi = _read_pct_range_filter(
+                                    slider_state_key, pct_lo, pct_hi
+                                )
+                                if col_name == SUGGESTION_COL_LATENT_1W:
+                                    lat_1w_lo, lat_1w_hi = lo, hi
+                                elif col_name == SUGGESTION_COL_LATENT_1M:
+                                    lat_1m_lo, lat_1m_hi = lo, hi
+                                elif col_name == SUGGESTION_COL_LATENT_1Y:
+                                    lat_1y_lo, lat_1y_hi = lo, hi
+
+                            before_latent = len(suggestions_pre_latent)
+                            suggestions_view = filter_suggestions_by_latent_returns(
+                                suggestions_pre_latent,
+                                min_latent_1w=lat_1w_lo,
+                                max_latent_1w=lat_1w_hi,
+                                min_latent_1m=lat_1m_lo,
+                                max_latent_1m=lat_1m_hi,
+                                min_latent_1y=lat_1y_lo,
+                                max_latent_1y=lat_1y_hi,
+                            )
+                            if latent_hist_specs:
+                                st.markdown("### Répartition des candidats")
+                                st.caption(
+                                    "Déplacez les **curseurs sous chaque graphique** pour filtrer "
+                                    "table et histogrammes (plus-value latente = rendement cours sans PRU). "
+                                    f"**{len(suggestions_view)}** / {len(suggestions_pre_latent)} "
+                                    "candidat(s) affiché(s) · traits : **P25** (orange), "
+                                    "**médiane** (rouge), **P75** (vert)."
+                                )
+                                h_charts = st.columns(len(latent_hist_specs))
+                                h_sliders = st.columns(len(latent_hist_specs))
+                                for chart_col, slider_col, (
+                                    col_name,
+                                    title,
+                                    x_title,
+                                    tick_fmt,
+                                    pos_only,
+                                    slider_label,
+                                    slider_key,
+                                    slider_default,
+                                ) in zip(h_charts, h_sliders, latent_hist_specs):
+                                    hist_vals = _sugg_hist_values(
+                                        suggestions_view[col_name],
+                                        positive_only=pos_only,
+                                    )
+                                    fig_latent = build_universe_histogram(
+                                        hist_vals,
+                                        title=title,
+                                        xaxis_title=x_title,
+                                        tickformat=tick_fmt,
+                                    )
+                                    if fig_latent is not None:
+                                        chart_col.plotly_chart(
+                                            fig_latent, use_container_width=True
+                                        )
+                                    else:
+                                        chart_col.info(
+                                            "Aucune donnée dans la plage sélectionnée."
+                                        )
+                                    pct_lo, pct_hi = _latent_return_pct_bounds(
+                                        suggestions_pre_latent[col_name],
+                                        default=slider_default,
+                                    )
+                                    _render_pct_range_slider(
+                                        slider_col,
+                                        slider_label,
+                                        f"{slider_key}_range",
+                                        pct_lo,
+                                        pct_hi,
+                                    )
+
+                            if latent_hist_specs and len(suggestions_view) < before_latent:
+                                if "plus-value latente" not in filter_parts:
+                                    filter_parts.append("plus-value latente")
+                            suggestions_after_latent = suggestions_view
+                        else:
+                            suggestions_after_latent = suggestions_pre_latent
+
+                        cand_hist_lo = cand_hist_hi = None
+                        hist_yield_lo = hist_yield_hi = None
+                        hist_cov_lo = hist_cov_hi = None
+                        other_hist_specs = []
+                        if "Rendement candidat" in suggestions_after_latent.columns:
+                            other_hist_specs.append(
+                                (
+                                    "Rendement candidat",
+                                    "Répartition — rendement candidat (annualisé)",
+                                    "Rendement candidat (%)",
+                                    ".1%",
+                                    False,
+                                    "Rendement candidat",
+                                    "sugg_hist_cand",
+                                    "pct",
+                                )
+                            )
+                        if HAS_DIVIDENDES and "Rendement" in suggestions_after_latent.columns:
+                            other_hist_specs.append(
+                                (
+                                    "Rendement",
+                                    "Répartition des rendements",
+                                    "Rendement (%)",
+                                    ".1%",
+                                    True,
+                                    "Rendement dividende",
+                                    "sugg_hist_yield",
+                                    "pct",
+                                )
+                            )
+                        if HAS_DIVIDENDES and "Ratio couverture" in suggestions_after_latent.columns:
+                            other_hist_specs.append(
+                                (
+                                    "Ratio couverture",
+                                    "Répartition des ratios de couverture",
+                                    "Ratio de couverture (×)",
+                                    ".2f",
+                                    True,
+                                    "Ratio couverture",
+                                    "sugg_hist_cov",
+                                    "num",
+                                )
+                            )
+                        for (
+                            col_name,
+                            _title,
+                            _x_title,
+                            _tick_fmt,
+                            pos_only,
+                            _slider_label,
+                            slider_key,
+                            bounds_kind,
+                        ) in other_hist_specs:
+                            b_lo, b_hi = _suggestion_other_hist_bounds(
+                                col_name,
+                                suggestions_after_latent[col_name],
+                                positive_only=pos_only,
+                            )
+                            slider_state_key = f"{slider_key}_range"
+                            if bounds_kind == "pct":
+                                lo, hi = _read_pct_range_filter(
+                                    slider_state_key, b_lo, b_hi
+                                )
+                            else:
+                                lo, hi = _read_numeric_range_filter(
+                                    slider_state_key, b_lo, b_hi
+                                )
+                            if col_name == "Rendement candidat":
+                                cand_hist_lo, cand_hist_hi = lo, hi
+                            elif col_name == "Rendement":
+                                hist_yield_lo, hist_yield_hi = lo, hi
+                            elif col_name == "Ratio couverture":
+                                hist_cov_lo, hist_cov_hi = lo, hi
+
+                        before_other_hist = len(suggestions_after_latent)
+                        suggestions_view = suggestions_after_latent
+                        if cand_hist_lo is not None or cand_hist_hi is not None:
+                            suggestions_view = filter_suggestions_by_statistics(
+                                suggestions_view,
+                                min_candidate_return=cand_hist_lo,
+                                max_candidate_return=cand_hist_hi,
+                            )
+                        if HAS_DIVIDENDES and (
+                            hist_yield_lo is not None
+                            or hist_yield_hi is not None
+                            or hist_cov_lo is not None
+                            or hist_cov_hi is not None
+                        ):
+                            suggestions_view = dividendes.filter_suggestions_by_dividends(
+                                suggestions_view,
+                                min_yield=hist_yield_lo,
+                                max_yield=hist_yield_hi,
+                                min_coverage=hist_cov_lo,
+                                max_coverage=hist_cov_hi,
+                            )
+
+                        if other_hist_specs and not suggestions_after_latent.empty:
+                            st.markdown("### Autres répartitions")
+                            st.caption(
+                                "Curseurs sous chaque graphique — table et histogrammes synchronisés. "
+                                f"**{len(suggestions_view)}** / {len(suggestions_after_latent)} "
+                                "candidat(s) affiché(s)."
+                            )
+                            div_hist_specs = [
+                                s
+                                for s in other_hist_specs
+                                if s[0] in ("Rendement", "Ratio couverture")
+                            ]
+                            cand_hist_spec = next(
+                                (s for s in other_hist_specs if s[0] == "Rendement candidat"),
+                                None,
+                            )
+
+                            if div_hist_specs:
+                                h_div_charts = st.columns(len(div_hist_specs))
+                                h_div_sliders = st.columns(len(div_hist_specs))
+                                for chart_col, slider_col, spec in zip(
+                                    h_div_charts, h_div_sliders, div_hist_specs
+                                ):
+                                    (
+                                        col_name,
+                                        title,
+                                        x_title,
+                                        tick_fmt,
+                                        pos_only,
+                                        slider_label,
+                                        slider_key,
+                                        bounds_kind,
+                                    ) = spec
+                                    hist_vals = _sugg_hist_values(
+                                        suggestions_view[col_name],
+                                        positive_only=pos_only,
+                                    )
+                                    fig_div = dividendes.build_dividend_universe_histogram(
+                                        hist_vals,
+                                        title=title,
+                                        xaxis_title=x_title,
+                                        tickformat=tick_fmt,
+                                    )
+                                    if fig_div is not None:
+                                        chart_col.plotly_chart(
+                                            fig_div, use_container_width=True
+                                        )
+                                    else:
+                                        chart_col.info(
+                                            "Aucune donnée dans la plage sélectionnée."
+                                        )
+                                    b_lo, b_hi = _suggestion_other_hist_bounds(
+                                        col_name,
+                                        suggestions_after_latent[col_name],
+                                        positive_only=pos_only,
+                                    )
+                                    if bounds_kind == "pct":
+                                        _render_pct_range_slider(
+                                            slider_col,
+                                            slider_label,
+                                            f"{slider_key}_range",
+                                            b_lo,
+                                            b_hi,
+                                        )
+                                    else:
+                                        _render_pct_range_slider(
+                                            slider_col,
+                                            slider_label,
+                                            f"{slider_key}_range",
+                                            b_lo,
+                                            b_hi,
+                                            step=0.1,
+                                        )
+
+                            if cand_hist_spec:
+                                (
+                                    col_name,
+                                    title,
+                                    x_title,
+                                    tick_fmt,
+                                    pos_only,
+                                    slider_label,
+                                    slider_key,
+                                    bounds_kind,
+                                ) = cand_hist_spec
+                                hist_vals = _sugg_hist_values(
+                                    suggestions_view[col_name],
+                                    positive_only=pos_only,
+                                )
+                                fig_cand = build_universe_histogram(
+                                    hist_vals,
+                                    title=title,
+                                    xaxis_title=x_title,
+                                    tickformat=tick_fmt,
+                                )
+                                if fig_cand is not None:
+                                    st.plotly_chart(fig_cand, use_container_width=True)
+                                else:
+                                    st.info(
+                                        "Aucun rendement candidat dans la plage sélectionnée."
+                                    )
+                                b_lo, b_hi = _suggestion_other_hist_bounds(
+                                    col_name,
+                                    suggestions_after_latent[col_name],
+                                    positive_only=pos_only,
+                                )
+                                _render_pct_range_slider(
+                                    st.container(),
+                                    slider_label,
+                                    f"{slider_key}_range",
+                                    b_lo,
+                                    b_hi,
+                                )
+
+                        hist_filter_active = len(suggestions_view) < len(
+                            suggestions_pre_latent
+                        )
+                        if hist_filter_active and filter_parts:
+                            if len(suggestions_view) < before_other_hist:
+                                if cand_hist_lo is not None or cand_hist_hi is not None:
+                                    if "rendement candidat" not in filter_parts:
+                                        filter_parts.append("rendement candidat")
+                                if hist_yield_lo is not None or hist_yield_hi is not None:
+                                    if "rendement dividende" not in filter_parts:
+                                        filter_parts.append("rendement dividende")
+                                if hist_cov_lo is not None or hist_cov_hi is not None:
+                                    if "couverture" not in filter_parts:
+                                        filter_parts.append("couverture")
+                            st.caption(
+                                f"Filtre {' + '.join(filter_parts)} : "
+                                f"**{len(suggestions_view)}** / {len(suggestions)} "
+                                "candidats conservés."
+                            )
+                        elif hist_filter_active:
+                            st.caption(
+                                f"Filtre curseurs histogrammes : "
+                                f"**{len(suggestions_view)}** / {len(suggestions)} "
+                                "candidats conservés."
+                            )
+
+                        with suggestions_table_slot.container():
+                            if suggestions_view.empty:
+                                if not suggestions_pre_latent.empty and hist_filter_active:
+                                    st.warning(
+                                        "Aucun candidat ne passe les plages des curseurs sous les "
+                                        "graphiques. Élargissez les bornes."
+                                    )
+                            else:
+                                display_df = suggestions_view.head(top_n).copy()
+                                if "Ticker" in display_df.columns and (
+                                    show_company_names or need_ticker_sectors
+                                ):
+                                    sugg_names, sugg_sectors = _resolve_ticker_metadata(
+                                        display_df["Ticker"].tolist(),
+                                        ticker_names,
+                                        ticker_sectors,
+                                        need_names=show_company_names,
+                                        need_sectors=need_ticker_sectors,
+                                    )
+                                    display_df = add_company_names(
+                                        display_df,
+                                        sugg_names,
+                                        show_names=show_company_names,
+                                        sectors=sugg_sectors if need_ticker_sectors else None,
+                                    )
+                                elif "Ticker" in display_df.columns:
+                                    display_df = add_company_names(
+                                        display_df,
+                                        {},
+                                        show_names=False,
+                                        sectors=None,
+                                    )
+                                display_view = rename_columns_for_display(
+                                    display_df, SUGGESTIONS_LABELS
+                                )
+                                sugg_format = format_map_for_labeled_columns(
+                                    display_view, SUGGESTIONS_LABELS, SUGGESTIONS_FORMAT
+                                )
+                                st.caption(
+                                    "Rendements et volatilités en **%** · corrélations sur **0–1** · "
+                                    "Δ = impact simulé sur le portefeuille · "
+                                    "**Plus-value latente** = rendement cours sur ~5 j, ~21 j ou ~252 j "
+                                    "(sans PRU — performance récente du titre seul)."
+                                )
+                                if HAS_FUNDAMENTALS and any(
+                                    c in display_df.columns
+                                    for c in fundamentals.SUGGESTION_QUALITY_COLUMNS
+                                ):
+                                    st.caption(
+                                        "Indicateurs fondamentaux : **vert** = repère favorable · "
+                                        "**rouge** = repère défavorable (voir page *Dividendes & Qualité*)."
+                                    )
+                                if any(
+                                    c in display_df.columns
+                                    for c in SUGGESTION_TECHNICAL_COLUMNS
+                                ):
+                                    st.caption(
+                                        "Indicateurs techniques : **vert** = survente / bas de bande · "
+                                        "**rouge** = surachat / haut de bande."
+                                    )
+                                if HAS_DIVIDENDES and any(
+                                    c in display_df.columns
+                                    for c in dividendes.SUGGESTION_DIVIDEND_COLUMNS
+                                ):
+                                    st.caption(
+                                        "Indicateurs dividendes : **vert** = rendement / croissance / "
+                                        "couverture favorables · **rouge** = signaux faibles."
+                                    )
+                                styled_sugg = display_view.style.format(sugg_format, na_rep="-")
+                                grad_pos = pick_existing_columns(
+                                    display_view,
+                                    "Score composite (pts)",
+                                    "Δ Rendement portef. (%)",
+                                    "Plus-value latente 1 sem. (%)",
+                                    "Plus-value latente 1 mois (%)",
+                                    "Plus-value latente 1 an (%)",
+                                )
+                                if grad_pos:
+                                    styled_sugg = styled_sugg.background_gradient(
+                                        cmap="RdYlGn", subset=grad_pos
+                                    )
+                                grad_neg = pick_existing_columns(
+                                    display_view,
+                                    "Δ Volatilité portef. (%)",
+                                    "Δ Kurtosis portef.",
+                                    "Δ Corr. interne (0–1)",
+                                )
+                                if grad_neg:
+                                    styled_sugg = styled_sugg.background_gradient(
+                                        cmap="RdYlGn", subset=grad_neg
+                                    )
+                                if HAS_FUNDAMENTALS:
+                                    styled_sugg = fundamentals.style_fundamentals_sentiment(
+                                        styled_sugg
+                                    )
+                                if any(
+                                    c in display_df.columns
+                                    for c in SUGGESTION_TECHNICAL_COLUMNS
+                                ):
+                                    styled_sugg = style_suggestions_technical(styled_sugg)
+                                if HAS_DIVIDENDES and any(
+                                    c in display_df.columns
+                                    for c in dividendes.SUGGESTION_DIVIDEND_COLUMNS
+                                ):
+                                    styled_sugg = dividendes.style_dividend_sentiment(styled_sugg)
+                                st.dataframe(styled_sugg)
+
+                        if not suggestions_view.empty:
                             st.markdown("### Visualisation des compromis")
                             plot_df = suggestions_view.head(min(50, len(suggestions_view))).copy()
                             if show_company_names and "Ticker" in plot_df.columns:
@@ -3288,7 +4346,7 @@ due à la fenêtre Hanning (reconstruction harmonique pondérée + tendance loca
                         )
 
 
-if vue == "Dividendes & Qualité" and HAS_DIVIDENDES:
+if vue in VUES_UNIVERS_DIVIDENDES and HAS_DIVIDENDES:
     pf_tickers = sorted({str(t).strip() for t in liste_tickers}) if liste_tickers else None
     with st.expander("Univers dividendes — tickers.json (5000 actions)", expanded=True):
         dividendes.render_dividend_universe_builder(portfolio_tickers=pf_tickers)

@@ -1511,7 +1511,12 @@ def _add_fft_split_trace(
 
 
 def compute_fft_summary_for_prices(
-    prices, min_period_days=5, max_period_days=None, top_n=3, trend_mode=FFT_TREND_LOG_LINEAR
+    prices,
+    min_period_days=5,
+    max_period_days=None,
+    top_n=3,
+    trend_mode=FFT_TREND_LOG_LINEAR,
+    signal_mode="price",
 ):
     """Tableau récapitulatif : périodes dominantes par ticker."""
     rows = []
@@ -1522,6 +1527,7 @@ def compute_fft_summary_for_prices(
             max_period_days=max_period_days,
             top_n=top_n,
             trend_mode=trend_mode,
+            signal_mode=signal_mode,
         )
         if result is None:
             continue
@@ -2651,6 +2657,141 @@ def compute_volume_sma(volume, period=20):
     return v.rolling(period).mean()
 
 
+def compute_turnover_value(volume, close):
+    """Valeur échangée journalière : volume × cours de clôture."""
+    vol = pd.to_numeric(volume, errors="coerce")
+    price = pd.to_numeric(close, errors="coerce")
+    aligned = pd.concat([vol, price], axis=1, keys=["volume", "close"]).dropna()
+    if aligned.empty:
+        return pd.Series(dtype=float)
+    return aligned["volume"] * aligned["close"]
+
+
+def _turnover_sma(turnover, period=20):
+    t = pd.to_numeric(turnover, errors="coerce").dropna()
+    if len(t) < period:
+        return pd.Series(dtype=float)
+    return t.rolling(period).mean()
+
+
+def summarize_turnover(volume, close, period=20):
+    """Résumé de la valeur échangée (dernière séance et ratio vs moyenne mobile)."""
+    turnover = compute_turnover_value(volume, close)
+    if turnover.empty:
+        return None
+    last = float(turnover.iloc[-1])
+    avg = _last_valid(_turnover_sma(turnover, period))
+    ratio = last / avg if avg and avg > 0 else None
+    return {"last": last, "ratio": ratio}
+
+
+def turnover_ratio_signal(ratio):
+    return volume_ratio_signal(ratio)
+
+
+def interpret_turnover_comment(volume_series, close_series, period=20, currency="€"):
+    """Commentaire pédagogique sur la valeur échangée (volume × prix)."""
+    summary = summarize_turnover(volume_series, close_series, period=period)
+    if summary is None:
+        return "Données insuffisantes pour commenter la valeur échangée."
+
+    last = summary["last"]
+    ratio = summary["ratio"]
+    if ratio is not None:
+        if ratio >= 1.5:
+            intensity = (
+                f"**Situation :** valeur échangée **élevée** "
+                f"({last:,.0f} {currency}, **{ratio:.1f}×** la moyenne sur {period} jours)."
+            )
+        elif ratio <= 0.7:
+            intensity = (
+                f"**Situation :** valeur échangée **faible** "
+                f"({last:,.0f} {currency}, **{ratio:.1f}×** la moyenne sur {period} jours)."
+            )
+        else:
+            intensity = (
+                f"**Situation :** valeur échangée **dans la normale** "
+                f"({last:,.0f} {currency}, **{ratio:.1f}×** la moyenne sur {period} jours)."
+            )
+    else:
+        intensity = f"**Situation :** valeur échangée du jour : **{last:,.0f} {currency}**."
+
+    guide = (
+        "**Comment lire :** la **valeur échangée** multiplie le **volume** (titres échangés) "
+        f"par le **cours** ({currency}). Elle mesure l'**activité monétaire** sur le titre, "
+        "plus parlante que le seul volume quand le prix varie. "
+        f"Comparez les barres au trait orange (moyenne mobile sur **{period} jours**)."
+    )
+    return f"{intensity}\n\n{guide}"
+
+
+def build_turnover_value_figure(
+    volume_series,
+    close_series,
+    *,
+    detail_label="Actif",
+    period=20,
+    currency="€",
+    ohlc=None,
+):
+    """Graphique de la valeur échangée (volume × prix) et moyenne mobile."""
+    from chart_theme import CHART_HEIGHT, apply_chart_theme
+
+    close = pd.to_numeric(close_series, errors="coerce").dropna()
+    if close.empty:
+        return None
+
+    turnover = compute_turnover_value(volume_series, close)
+    if turnover.dropna().size < 5:
+        return None
+
+    has_ohlc = ohlc is not None and not ohlc.empty
+    idx = turnover.dropna().index
+    bar_colors = []
+    for d in idx:
+        if has_ohlc and d in ohlc.index:
+            bar_colors.append(
+                "#26a69a" if ohlc.loc[d, "close"] >= ohlc.loc[d, "open"] else "#ef5350"
+            )
+        elif d in close.index and pd.notna(close.loc[d]) and pd.notna(close.shift(1).loc[d]):
+            bar_colors.append("#26a69a" if close.loc[d] >= close.shift(1).loc[d] else "#ef5350")
+        else:
+            bar_colors.append("#42a5f5")
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=idx,
+            y=turnover.loc[idx],
+            name=f"Valeur échangée ({currency})",
+            marker_color=bar_colors,
+            opacity=0.7,
+        )
+    )
+    turnover_sma = _turnover_sma(turnover, period)
+    if not turnover_sma.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=turnover_sma.index,
+                y=turnover_sma,
+                mode="lines",
+                name=f"Moy. {period}j",
+                line=dict(color="orange", width=1.5),
+            )
+        )
+
+    fig.update_layout(
+        title=f"{detail_label} — Valeur échangée ({currency})",
+        xaxis_title="Date",
+        yaxis_title=f"Valeur ({currency})",
+        xaxis_rangeslider_visible=False,
+        hovermode="x unified",
+    )
+    _apply_plotly_crosshair(fig, subplot=False)
+    apply_chart_theme(fig, height=CHART_HEIGHT.get("turnover", 420), legend_horizontal=True)
+    return fig
+
+
 def compute_mfi(high, low, close, volume, period=14):
     """Money Flow Index : RSI pondéré par le volume (0–100)."""
     h = pd.to_numeric(high, errors="coerce")
@@ -3560,6 +3701,7 @@ def compute_technical_indicators(
 
         last_vol = np.nan
         vol_ratio = np.nan
+        last_turnover = np.nan
         last_mfi = np.nan
         obv_sig = "N/A"
         if vol_s is not None and vol_s.dropna().size >= 20:
@@ -3567,6 +3709,9 @@ def compute_technical_indicators(
             vol_avg = compute_volume_sma(vol_s, 20)
             if not vol_avg.empty and vol_avg.iloc[-1] > 0:
                 vol_ratio = last_vol / float(vol_avg.iloc[-1])
+            turnover = compute_turnover_value(vol_s, s)
+            if not turnover.empty:
+                last_turnover = float(turnover.iloc[-1])
             obv = compute_obv(s, vol_s)
             if not obv.empty:
                 obv_sig = obv_trend_signal(obv)
@@ -3610,6 +3755,7 @@ def compute_technical_indicators(
                 "Volume": last_vol,
                 "Vol / Moy. 20j": vol_ratio,
                 "Signal Volume": volume_ratio_signal(vol_ratio),
+                "Valeur échangée": last_turnover,
                 "MFI": last_mfi,
                 "Signal MFI": mfi_signal(last_mfi),
                 "Tendance OBV": obv_sig,
@@ -4001,6 +4147,250 @@ def build_returns_distribution_var_figure(
         legend_horizontal=False,
     )
     return fig
+
+
+def _fmt_hist_stat(val, tickformat):
+    if tickformat == ".1%":
+        return f"{val:.2%}"
+    if tickformat:
+        return f"{val:{tickformat}}"
+    return f"{val:.2f}"
+
+
+def build_universe_histogram(
+    values,
+    *,
+    title,
+    xaxis_title,
+    tickformat=None,
+    nbins=35,
+):
+    """
+    Histogramme (abscisse = métrique, ordonnée = nombre d'actions)
+    avec médiane, percentiles 25 et 75.
+    """
+    from chart_theme import CHART_HEIGHT, apply_chart_theme
+
+    s = pd.Series(values, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+    if s.empty:
+        return None
+
+    p25 = float(s.quantile(0.25))
+    med = float(s.median())
+    p75 = float(s.quantile(0.75))
+    x_max = float(s.max())
+    x_min = float(s.min())
+    span = x_max - x_min
+    pad = span * 0.05 if span > 0 else 0.01
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Histogram(
+            x=s,
+            nbinsx=nbins,
+            name="Actions",
+            marker_color="rgba(37, 99, 235, 0.72)",
+            marker_line=dict(color="white", width=0.4),
+            hovertemplate="%{x}<br>%{y} action(s)<extra></extra>",
+        )
+    )
+    ref_lines = [
+        (p25, "P25", "#f97316", "dash"),
+        (med, "Médiane", "#dc2626", "solid"),
+        (p75, "P75", "#059669", "dash"),
+    ]
+    for x_val, label, color, dash in ref_lines:
+        fig.add_vline(
+            x=x_val,
+            line_width=2,
+            line_dash=dash,
+            line_color=color,
+            annotation_text=label,
+            annotation_position="top",
+            annotation_font_size=10,
+            annotation_font_color=color,
+        )
+
+    xaxis = dict(title=xaxis_title, range=[x_min - pad, x_max + pad])
+    if tickformat:
+        xaxis["tickformat"] = tickformat
+    fig.update_layout(
+        xaxis=xaxis,
+        yaxis_title="Nombre d'actions",
+        bargap=0.05,
+    )
+    subtitle = (
+        f"n = {len(s)} · P25 = {_fmt_hist_stat(p25, tickformat)} · "
+        f"médiane = {_fmt_hist_stat(med, tickformat)} · P75 = {_fmt_hist_stat(p75, tickformat)}"
+    )
+    apply_chart_theme(
+        fig,
+        height=CHART_HEIGHT.get("histogram", 360),
+        title=f"{title}<br><sup style='font-size:11px;color:#64748b'>{subtitle}</sup>",
+    )
+    fig.update_layout(margin=dict(t=88, l=48, r=32, b=52))
+    return fig
+
+
+CROSS_SECTION_MONTH_DAYS = 21
+SUGGESTION_WEEK_DAYS = 5
+SUGGESTION_YEAR_DAYS = 252
+SUGGESTION_COL_LATENT_1W = "Plus-value latente 1 sem."
+SUGGESTION_COL_LATENT_1M = "Plus-value latente 1 mois"
+SUGGESTION_COL_LATENT_1Y = "Plus-value latente 1 an"
+SUGGESTION_LATENT_RETURN_COLUMNS = (
+    SUGGESTION_COL_LATENT_1W,
+    SUGGESTION_COL_LATENT_1M,
+    SUGGESTION_COL_LATENT_1Y,
+)
+CROSS_SECTION_COL_PERIOD = "Rendement période (%)"
+CROSS_SECTION_COL_1D = "Rendement 1j (%)"
+CROSS_SECTION_COL_1M = "Rendement 1m (%)"
+CROSS_SECTION_COL_DIV_YIELD = "Rendement dividende (%)"
+CROSS_SECTION_COL_PER = "PER"
+
+
+RETURN_PCT_SLIDER_FLOOR = -100.0
+
+
+def return_pct_slider_bounds(values, *, floor_pct=RETURN_PCT_SLIDER_FLOOR):
+    """
+    Bornes min/max (en points %) pour sliders de rendement cours.
+    Le plancher est plafonné : un long-only ne peut pas perdre plus de 100 %.
+    """
+    s = pd.Series(values, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+    if s.empty:
+        return -10.0, 10.0
+    lo, hi = float(s.min()) * 100.0, float(s.max()) * 100.0
+    pad = max((hi - lo) * 0.05, 0.25)
+    lo = max(floor_pct, round(lo - pad, 2))
+    hi = round(hi + pad, 2)
+    if lo >= hi:
+        hi = lo + 1.0
+    return lo, hi
+
+
+def numeric_slider_bounds(values, *, floor=None, ceiling=None, default=(-10.0, 10.0)):
+    """Bornes min/max pour sliders numériques (PER, ratios, etc.)."""
+    s = pd.Series(values, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+    if s.empty:
+        return default
+    lo, hi = float(s.min()), float(s.max())
+    pad = max((hi - lo) * 0.05, 0.25)
+    lo, hi = lo - pad, hi + pad
+    if floor is not None:
+        lo = max(floor, lo)
+    if ceiling is not None:
+        hi = min(ceiling, hi)
+    if lo >= hi:
+        hi = lo + 1.0
+    return round(lo, 2), round(hi, 2)
+
+
+def div_yield_slider_bounds_pct(values):
+    """Bornes slider rendement dividende (affichage en points %)."""
+    s = pd.Series(values, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+    s = s[s > 0]
+    if s.empty:
+        return 0.0, 10.0
+    lo, hi = float(s.min()) * 100.0, float(s.max()) * 100.0
+    pad = max((hi - lo) * 0.05, 0.1)
+    return round(max(0.0, lo - pad), 2), round(hi + pad, 2)
+
+
+def merge_cross_section_universe_metrics(returns_df, listing_df=None, per_by_ticker=None):
+    """Joint rendement dividende (univers) et PER (cache fondamentaux)."""
+    if returns_df is None or returns_df.empty:
+        return returns_df
+    out = returns_df.copy()
+    if listing_df is not None and not listing_df.empty and "Ticker" in listing_df.columns:
+        div_col = "Rendement (%)" if "Rendement (%)" in listing_df.columns else None
+        if div_col:
+            div = listing_df[["Ticker", div_col]].drop_duplicates(subset=["Ticker"], keep="last")
+            div = div.rename(columns={div_col: CROSS_SECTION_COL_DIV_YIELD})
+            out = out.merge(div, on="Ticker", how="left")
+    if per_by_ticker is not None:
+        out[CROSS_SECTION_COL_PER] = out["Ticker"].map(per_by_ticker)
+    return out
+
+
+def compute_cross_section_returns(prices, month_trading_days=CROSS_SECTION_MONTH_DAYS):
+    """
+    Rendements transversaux par ticker : période affichée, dernière séance, ~1 mois (21 j).
+    """
+    if prices is None or prices.empty:
+        return pd.DataFrame(
+            columns=["Ticker", CROSS_SECTION_COL_PERIOD, CROSS_SECTION_COL_1D, CROSS_SECTION_COL_1M]
+        )
+
+    rows = []
+    for col in prices.columns:
+        s = pd.to_numeric(prices[col], errors="coerce").dropna()
+        if len(s) < 2:
+            continue
+        row = {
+            "Ticker": col,
+            CROSS_SECTION_COL_PERIOD: float(s.iloc[-1] / s.iloc[0] - 1.0),
+            CROSS_SECTION_COL_1D: float(s.iloc[-1] / s.iloc[-2] - 1.0),
+            CROSS_SECTION_COL_1M: (
+                float(s.iloc[-1] / s.iloc[-1 - month_trading_days] - 1.0)
+                if len(s) > month_trading_days
+                else np.nan
+            ),
+        }
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def filter_cross_section_returns_by_ranges(
+    df,
+    *,
+    period_min=None,
+    period_max=None,
+    day_min=None,
+    day_max=None,
+    month_min=None,
+    month_max=None,
+    div_yield_min=None,
+    div_yield_max=None,
+    per_min=None,
+    per_max=None,
+):
+    """Filtre l'univers selon plages min/max (rendements cours, dividende, PER)."""
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+
+    def _apply_range(column, vmin, vmax):
+        nonlocal out
+        if vmin is None and vmax is None:
+            return
+        if column not in out.columns:
+            out = out.iloc[0:0]
+            return
+        vals = pd.to_numeric(out[column], errors="coerce")
+        mask = vals.notna()
+        if vmin is not None:
+            mask &= vals >= vmin
+        if vmax is not None:
+            mask &= vals <= vmax
+        out = out[mask]
+
+    _apply_range(CROSS_SECTION_COL_PERIOD, period_min, period_max)
+    if out.empty:
+        return out
+    _apply_range(CROSS_SECTION_COL_1D, day_min, day_max)
+    if out.empty:
+        return out
+    _apply_range(CROSS_SECTION_COL_1M, month_min, month_max)
+    if out.empty:
+        return out
+    _apply_range(CROSS_SECTION_COL_DIV_YIELD, div_yield_min, div_yield_max)
+    if out.empty:
+        return out
+    _apply_range(CROSS_SECTION_COL_PER, per_min, per_max)
+    return out
 
 
 def build_suggestions_tradeoff_scatter(
@@ -4552,6 +4942,110 @@ def suggest_portfolio_additions(
     return df.sort_values("Score composite", ascending=False), baseline, baseline_internal
 
 
+def _price_return_over_lookback(series, lookback_days):
+    """Rendement cours : dernière séance vs il y a lookback_days séances."""
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(s) < 2 or lookback_days < 1:
+        return np.nan
+    if len(s) <= lookback_days:
+        return np.nan
+    last = float(s.iloc[-1])
+    base = float(s.iloc[-1 - lookback_days])
+    if base == 0 or np.isnan(base):
+        return np.nan
+    return last / base - 1.0
+
+
+def compute_suggestion_latent_returns(
+    prices,
+    *,
+    week_days=SUGGESTION_WEEK_DAYS,
+    month_days=CROSS_SECTION_MONTH_DAYS,
+    year_days=SUGGESTION_YEAR_DAYS,
+):
+    """Plus-value latente (%) par ticker : ~1 semaine, ~1 mois, ~1 an de bourse."""
+    if prices is None or prices.empty:
+        return pd.DataFrame(columns=["Ticker", *SUGGESTION_LATENT_RETURN_COLUMNS])
+
+    rows = []
+    for col in prices.columns:
+        rows.append(
+            {
+                "Ticker": col,
+                SUGGESTION_COL_LATENT_1W: _price_return_over_lookback(
+                    prices[col], week_days
+                ),
+                SUGGESTION_COL_LATENT_1M: _price_return_over_lookback(
+                    prices[col], month_days
+                ),
+                SUGGESTION_COL_LATENT_1Y: _price_return_over_lookback(
+                    prices[col], year_days
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def merge_suggestion_latent_returns(df, prices):
+    """Joint les plus-values latentes au tableau de suggestions (clé Ticker)."""
+    if df is None or df.empty or prices is None or prices.empty:
+        return df
+
+    tickers = [t for t in df["Ticker"] if t in prices.columns]
+    if not tickers:
+        return df
+
+    latent_df = compute_suggestion_latent_returns(prices[tickers])
+    merged = df.drop(columns=[c for c in SUGGESTION_LATENT_RETURN_COLUMNS if c in df.columns])
+    merged = merged.merge(latent_df, on="Ticker", how="left")
+
+    cols = [c for c in merged.columns if c not in SUGGESTION_LATENT_RETURN_COLUMNS]
+    if "Rendement candidat" in cols:
+        idx = cols.index("Rendement candidat") + 1
+        for c in SUGGESTION_LATENT_RETURN_COLUMNS:
+            if c in merged.columns:
+                cols.insert(idx, c)
+                idx += 1
+    else:
+        cols.extend(c for c in SUGGESTION_LATENT_RETURN_COLUMNS if c in merged.columns)
+    return merged[cols]
+
+
+def filter_suggestions_by_latent_returns(
+    df,
+    *,
+    min_latent_1w=None,
+    max_latent_1w=None,
+    min_latent_1m=None,
+    max_latent_1m=None,
+    min_latent_1y=None,
+    max_latent_1y=None,
+):
+    """Filtre les suggestions selon les plus-values latentes (1 sem., 1 mois, 1 an)."""
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    specs = (
+        (SUGGESTION_COL_LATENT_1W, min_latent_1w, max_latent_1w),
+        (SUGGESTION_COL_LATENT_1M, min_latent_1m, max_latent_1m),
+        (SUGGESTION_COL_LATENT_1Y, min_latent_1y, max_latent_1y),
+    )
+    for col, vmin, vmax in specs:
+        if vmin is None and vmax is None:
+            continue
+        if col not in out.columns:
+            return out.iloc[0:0]
+        vals = pd.to_numeric(out[col], errors="coerce")
+        mask = vals.notna()
+        if vmin is not None:
+            mask &= vals >= vmin
+        if vmax is not None:
+            mask &= vals <= vmax
+        out = out[mask]
+    return out
+
+
 DEFAULT_SUGGESTION_OBJECTIVE_WEIGHTS = {
     "return": 1.0,
     "vol": 1.0,
@@ -4850,3 +5344,8 @@ def style_suggestions_technical(styler):
     return styler.apply(
         lambda s: _apply_technical_column_styles(s, include_signals=False), axis=0
     )
+
+
+from analytics_fft_missing import patch_analytics_fft  # noqa: E402
+
+patch_analytics_fft(globals())

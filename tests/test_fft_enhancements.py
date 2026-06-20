@@ -13,6 +13,7 @@ from analytics import (
     build_fft_cyclic_chart,
     build_fft_extended_series,
     compute_fft_model_correlations,
+    compute_fft_holdout_validation,
     compute_fft_periodicity,
     reconstruct_harmonic_cycles,
 )
@@ -123,3 +124,51 @@ def test_build_fft_cyclic_chart_ma_mode():
     assert fig is not None
     trace_names = [t.name for t in fig.data]
     assert any("MM41" in (n or "") for n in trace_names)
+
+
+def test_fft_holdout_validation_on_synthetic():
+    s = _synthetic_price(280)
+    holdout = compute_fft_holdout_validation(
+        s,
+        holdout_days=30,
+        min_period_days=5,
+        max_period_days=120,
+        trend_mode=FFT_TREND_LOG_LINEAR,
+        recon_mode=FFT_RECON_FFT,
+        n_components=3,
+    )
+    assert holdout is not None
+    assert holdout["shifted_window"] is False
+    assert len(holdout["actual_prices"]) == 30
+    assert len(holdout["model_prices"]) == 30
+    assert len(holdout["model_in_sample"]) == holdout["train_n_obs"]
+    assert holdout["corr"] is not None
+    assert holdout["corr_in_sample"] is not None
+
+
+def test_fft_holdout_shifted_window():
+    s = _synthetic_price(280)
+    holdout = compute_fft_holdout_validation(
+        s,
+        holdout_days=30,
+        min_period_days=5,
+        max_period_days=120,
+        shifted_window=True,
+        n_components=3,
+    )
+    assert holdout is not None
+    assert holdout["shifted_window"] is True
+    assert holdout["train_n_obs"] == len(s) - 60
+
+
+def test_build_fft_cyclic_chart_with_holdout():
+    s = _synthetic_price(280)
+    result = compute_fft_periodicity(s, min_period_days=5, max_period_days=120)
+    holdout = compute_fft_holdout_validation(
+        s, holdout_days=30, min_period_days=5, max_period_days=120, n_components=3
+    )
+    fig = build_fft_cyclic_chart(result, holdout_validation=holdout)
+    names = " ".join((t.name or "").lower() for t in fig.data)
+    assert "holdout" in names
+    assert "calibrage" in names
+    assert "projection" in names

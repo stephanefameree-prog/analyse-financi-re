@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -19,7 +20,8 @@ from display_units import (
     rename_columns_for_display,
 )
 
-WATCHLISTS_PATH = "watchlists.json"
+WATCHLISTS_FILENAME = "watchlists.json"
+WATCHLISTS_PATH = Path(__file__).resolve().parent / WATCHLISTS_FILENAME
 DEFAULT_WATCHLIST_NAME = "Ma watchlist"
 
 
@@ -28,7 +30,7 @@ def _empty_store():
 
 
 def load_watchlists_data():
-    if not os.path.exists(WATCHLISTS_PATH):
+    if not WATCHLISTS_PATH.is_file():
         return _empty_store()
     try:
         with open(WATCHLISTS_PATH, "r", encoding="utf-8") as f:

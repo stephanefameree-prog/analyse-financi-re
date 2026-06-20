@@ -1,8 +1,15 @@
 # Dashboard financier V6.3
 
-Application **Streamlit** d'analyse de portefeuille et de marchés : synthèse P&L, risque, Markowitz, dividendes, fondamentaux, technique, FFT, watchlists.
+Application d'analyse de portefeuille et de marchés : synthèse P&L, risque, Markowitz, dividendes, fondamentaux, technique, FFT, watchlists.
 
-## Lancement
+Deux interfaces :
+
+| Interface | Fichier | Usage |
+|-----------|---------|--------|
+| **Streamlit** (actuelle) | `dashboardV6.3.py` | UI complète, barre latérale |
+| **FastAPI** (nouvelle) | `analyse financière avec fast api/` | Backend REST + `/docs` |
+
+## Lancement Streamlit
 
 ```bash
 cd "analyse financiere"
@@ -11,6 +18,20 @@ streamlit run dashboardV6.3.py
 ```
 
 Sous Windows : double-clic sur `lancerdashboard.bat`.
+
+## Lancement API FastAPI
+
+Voir le dossier **`analyse financière avec fast api/README.md`**.
+
+```bash
+cd "analyse financière avec fast api"
+pip install -r requirements.txt
+uvicorn api.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+Sous Windows : double-clic sur `analyse financière avec fast api/lancer_api.bat`.
+
+Documentation : [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
 
 Depuis le dossier parent `Documenten`, vous pouvez aussi lancer `dashboardV6.3.py` (redirecteur).
 

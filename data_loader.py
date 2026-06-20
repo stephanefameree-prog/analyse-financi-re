@@ -1,3 +1,4 @@
+import logging
 import hashlib
 import os
 import pickle
@@ -17,6 +18,19 @@ INCREMENTAL_LOOKBACK_DAYS = 10
 FULL_CACHE_MAX_AGE_HOURS = 24
 DEFAULT_BATCH_SIZE = 100
 OHLCV_FRAME_KEYS = ("prices", "volumes", "highs", "lows", "opens", "ohlc_closes")
+
+
+def _ui_warning(message: str) -> None:
+    """Avertissement UI Streamlit si contexte actif, sinon log."""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        if get_script_run_ctx() is not None:
+            st.warning(message)
+            return
+    except Exception:
+        pass
+    logging.getLogger(__name__).warning(message)
 
 
 def filter_valid_tickers(tickers, start_date):
@@ -443,7 +457,7 @@ def _fetch_ohlcv_from_yahoo(tickers, start, end=None, batch_size=DEFAULT_BATCH_S
                 continue
 
     if failed:
-        st.warning(f"{len(failed)} tickers ignorés (Pas de données sur Yahoo) : {failed}")
+        _ui_warning(f"{len(failed)} tickers ignorés (Pas de données sur Yahoo) : {failed}")
 
     def _concat_frames(frames):
         if not frames:

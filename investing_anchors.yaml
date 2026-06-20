@@ -242,3 +242,115 @@ anchors:
     comparable_fv: 161.53
     dcf_fv: 150.10
     ddm_fv: 194.13
+
+  - ticker: ACN
+    full_ticker: NYSE:ACN
+    name: Accenture
+    as_of: "2026-06-12"
+    price: 167.52
+    fair_value: 280.43
+    label: Sous-évaluée
+    per: 13.73
+    roe: 0.2461
+    roic: 0.2963
+    dividend_yield: 0.0389
+    analyst_upside: 0.419
+    comparable_fv: 280.43
+    dcf_fv: 280.43
+    ddm_fv: 280.43
+
+  - ticker: CRM
+    full_ticker: NYSE:CRM
+    name: Salesforce
+    as_of: "2026-06-12"
+    price: 166.45
+    fair_value: 265.99
+    label: Sous-évaluée
+    per: 19.31
+    roe: 0.1261
+    roic: 0.1015
+    dividend_yield: 0.0106
+    analyst_upside: 0.515
+    comparable_fv: 265.99
+    dcf_fv: 265.99
+    ddm_fv: 265.99
+
+  - ticker: NOW
+    full_ticker: NYSE:NOW
+    name: ServiceNow
+    as_of: "2026-06-12"
+    price: 103.08
+    fair_value: 153.38
+    label: Sous-évaluée
+    per: 61.36
+    roe: 0.1348
+    roic: 0.1517
+    dividend_yield: 0
+    analyst_upside: 0.296
+    comparable_fv: 153.38
+    dcf_fv: 153.38
+    ddm_fv: 153.38
+
+  - ticker: PDD
+    full_ticker: NASDAQGS:PDD
+    name: PDD Holdings
+    as_of: "2026-06-12"
+    price: 81.30
+    fair_value: 107.32
+    label: Sous-évaluée
+    per: 8.522
+    roe: 0.2367
+    roic: 0.3153
+    dividend_yield: 0
+    analyst_upside: 0.443
+    comparable_fv: 107.32
+    dcf_fv: 107.32
+    ddm_fv: 107.32
+
+  - ticker: UBER
+    full_ticker: NYSE:UBER
+    name: Uber Technologies
+    as_of: "2026-06-12"
+    price: 69.55
+    fair_value: 89.51
+    label: Sous-évaluée
+    per: 17.26
+    roe: 0.3718
+    roic: 0.154
+    dividend_yield: 0
+    analyst_upside: 0.558
+    comparable_fv: 89.51
+    dcf_fv: 89.51
+    ddm_fv: 89.51
+
+  - ticker: TMUS
+    full_ticker: NASDAQGS:TMUS
+    name: T-Mobile US
+    as_of: "2026-06-12"
+    price: 185.82
+    fair_value: 233.95
+    label: Sous-évaluée
+    per: 19.77
+    roe: 0.1857
+    roic: 0.07905
+    dividend_yield: 0.022
+    analyst_upside: 0.404
+    comparable_fv: 233.95
+    dcf_fv: 233.95
+    ddm_fv: 233.95
+
+  - ticker: MSFT
+    full_ticker: NASDAQGS:MSFT
+    name: Microsoft
+    as_of: "2026-06-12"
+    price: 390.34
+    fair_value: 477.00
+    label: Sous-évaluée
+    per: 23.26
+    roe: 0.2965
+    roic: 0.2778
+    dividend_yield: 0.0093
+    analyst_upside: 0.397
+    comparable_fv: 477.00
+    dcf_fv: 477.00
+    ddm_fv: 477.00

@@ -300,6 +300,7 @@ def cached_fft_periodicity_ticker(
     max_period: int,
     top_n: int,
     trend_mode: str,
+    signal_mode: str,
 ):
     prices, _, _, _, _, _ = _cached_ohlcv_bundle(ohlcv_sig, tickers_tuple, start_date_str)
     if prices.empty or ticker not in prices.columns:
@@ -310,6 +311,7 @@ def cached_fft_periodicity_ticker(
         max_period_days=max_period,
         top_n=top_n,
         trend_mode=trend_mode,
+        signal_mode=signal_mode,
     )
 
 
@@ -324,6 +326,7 @@ def cached_fft_periodicity_portfolio(
     max_period: int,
     top_n: int,
     trend_mode: str,
+    signal_mode: str,
 ):
     prices, _, _, _, _, _ = _cached_ohlcv_bundle(ohlcv_sig, tickers_tuple, start_date_str)
     if prices.empty:
@@ -346,6 +349,7 @@ def cached_fft_periodicity_portfolio(
         max_period_days=max_period,
         top_n=top_n,
         trend_mode=trend_mode,
+        signal_mode=signal_mode,
     )
 
 
@@ -356,6 +360,7 @@ def cached_fft_summary(
     max_period: int,
     top_n: int,
     trend_mode: str,
+    signal_mode: str,
     tickers_tuple: tuple,
     start_date_str: str,
 ):
@@ -368,6 +373,7 @@ def cached_fft_summary(
         max_period_days=max_period,
         top_n=top_n,
         trend_mode=trend_mode,
+        signal_mode=signal_mode,
     )
 
 
